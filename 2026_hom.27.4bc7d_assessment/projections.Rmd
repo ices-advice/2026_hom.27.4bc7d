@@ -1,0 +1,572 @@
+---
+title: "North Sea Horse Mackerel (hom.27.4bc7d) - Short-term forecast"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+params:
+  model_file: "model/model_final.RData"
+  imy_catch: 970   # assumed intermediate-year catch = the quota (t)
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    df_print: kable
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+
+library(FLCore)
+library(FLAssess)
+library(stockassessment)
+suppressWarnings(suppressMessages(library(FLSAM)))  # ssb()/rec()/fbar() with CIs off the SAM fit
+library(FLash)          # loaded last so FLash::fwd / fwdControl win
+library(icesTAF)
+library(ggplot2)
+library(patchwork)
+library(dplyr)
+library(knitr)
+
+theme_set(theme_bw())
+
+stockcode <- "hom.27.4bc7d"
+
+# one output tree per model run, keyed off the model file name (benchmark / final / ...)
+run_name <- sub("^model_", "", tools::file_path_sans_ext(basename(params$model_file)))
+
+FIG_DIR  <- file.path("report/figures", run_name)
+FC_DIR   <- file.path("forecast", run_name)
+mkdir("report"); mkdir(FIG_DIR); mkdir(FC_DIR)
+
+# same helper as report.Rmd: save the figure to FIG_DIR at print resolution, then embed it
+save_and_show <- function(p, filename, width = 10, height = 6.5, dpi = 300) {
+  path <- file.path(FIG_DIR, filename)
+  if (inherits(p, "ggplot")) {
+    ggsave(path, plot = p, width = width, height = height, dpi = dpi, bg = "white")
+  } else {
+    png(path, width = width, height = height, units = "in", res = dpi, bg = "white")
+    on.exit(dev.off())
+    p()
+  }
+  knitr::include_graphics(path)
+}
+```
+
+```{r load}
+load(params$model_file, verbose = FALSE)   # NSHOM, NSHOM.tun, NSHOM.sam, NSHOM.ctrl, NSHOM.retro, NSHOM.loo
+hom <- NSHOM
+
+# forecast years derived from the assessment's own terminal year (no manual rollover)
+termYr <- NSHOM@range[["maxyear"]]
+ImY <- termYr + 1L   # intermediate year
+AdY <- termYr + 2L   # advice year
+CtY <- termYr + 3L   # continuation year
+
+# Intermediate-year catch assumption = the quota (external assumption, not from
+# the data); pass params$imy_catch to override.
+ImY.catch     <- as.numeric(params$imy_catch)
+ImY.catch.src <- "assumed quota"
+
+pg     <- hom@range[["max"]]
+fbrng  <- hom@range[c("minfbar", "maxfbar")]
+```
+
+# `r NSHOM@name` - forecast for `r ImY`-`r CtY`
+
+Assessment: **`r params$model_file`** (terminal year `r termYr`).
+Fbar range **`r fbrng[["minfbar"]]`-`r fbrng[["maxfbar"]]`**.
+Assumed `r ImY` catch: **`r format(round(ImY.catch), big.mark = ",")` t** (`r ImY.catch.src`).
+
+# Reference points
+
+```{r refpts}
+# Reference points for hom.27.4bc7d used in this short-term forecast.
+# Only the biomass reference points are used (drawn on the SSB projection plot);
+# no F reference point is applied - Fmsy and Fpa are not defined for this stock.
+refpts <- c(
+  Blim = 179580,
+  Bpa  = 269555
+)
+
+refpts_tbl <- data.frame(
+  `Reference point` = c("Blim", "Bpa"),
+  Value  = c(format(refpts[["Blim"]], big.mark = ",", scientific = FALSE),
+             format(refpts[["Bpa"]],  big.mark = ",", scientific = FALSE)),
+  Basis  = c("Biomass limit reference point (drawn on the SSB projection plot)",
+             "Biomass precautionary reference point (drawn on the SSB projection plot)"),
+  check.names = FALSE
+)
+kable(refpts_tbl, caption = "Reference points applied in the short-term forecast")
+```
+
+# 2025 ICES advice sheet (for reference)
+
+Reproduced from *ICES Advice 2025 - hom.27.4bc7d* (published 30 September 2025;
+[doi:10.17895/ices.advice.27202656](https://doi.org/10.17895/ices.advice.27202656)).
+These are last year's published values, except that the 2025 total catch and F in
+Table 1 have been replaced with the realised values now available from the
+current assessment (2025 is a real data year in this run). The forecast below is
+this year's update.
+
+## Values in the forecast and for the interim year (advice-sheet Table 1)
+
+```{r advice2025-t1}
+# 2025 catch and F(2-8) are the realised values from this assessment (the final run);
+# the published advice sheet printed the assumed 970 t bycatch quota and F = 0.025.
+c2025 <- round(c(computeCatch(hom)[, ac(termYr), drop = TRUE]))
+f2025 <- round(c(fbar(hom)[, ac(termYr), drop = TRUE]), 3)
+
+advice2025_t1 <- data.frame(
+  Variable = c("F ages 2-8 (2025)",
+               "Spawning-stock biomass (SSB; 2025) at spawning time",
+               "R age 1 (2025-2027)",
+               "Total catch (2025)"),
+  Value = c(sprintf("%.3f", f2025), "67,124", "418,272",
+            format(c2025, big.mark = ",")),
+  Notes = c("Realised - 2025 estimate from the current assessment (advice sheet: 0.025, on assumed catches)",
+            "Short-term forecast (STF); tonnes",
+            "Geometric mean 2014-2024; thousands",
+            "Realised 2025 catch (advice sheet: 970 t bycatch quota); tonnes"),
+  check.names = FALSE
+)
+kable(advice2025_t1,
+      caption = paste("ICES Advice 2025, Table 1 - values in the forecast and for the interim year.",
+                      "2025 catch and F are the realised values from this assessment;",
+                      "SSB and R are as published."))
+```
+
+## Annual catch scenarios (advice-sheet Table 2)
+
+```{r advice2025-t2}
+advice2025_t2 <- data.frame(
+  Basis = c("MSY approach: F = 0",
+            "F = Fmsy = Fpa",
+            "F = F2025",
+            "SSB2027 = Bpa, Blim, or SSB2026",
+            "Catch2026 = catch2025 - 20%",
+            "Catch2026 = catch2025",
+            "Catch2026 = catch2025 + 25%"),
+  `Total catch (2026)` = c("0", "-", "876", "-", "776", "970", "1,213"),
+  `F (2026)`           = c("0", "-", "0.025", "-", "0.022", "0.028", "0.035"),
+  `SSB (2026)`         = c("66,933", "-", "66,744", "-", "66,765", "66,723", "66,670"),
+  `SSB (2027)`         = c("66,025", "-", "65,165", "-", "65,263", "65,073", "64,836"),
+  `% SSB change`       = c("-1.35", "-", "-2.4", "-", "-2.2", "-2.5", "-2.8"),
+  `% TAC change`       = c("-100", "-", "-10.7", "-", "-22", "0", "22"),
+  `% advice change`    = c("0", "-", "-", "-", "-", "-", "-"),
+  check.names = FALSE
+)
+kable(advice2025_t2,
+      caption = paste("ICES Advice 2025, Table 2 - annual catch scenarios (tonnes).",
+                      "Rows 2 and 4 had no values: Fmsy/Fpa are not defined, and Bpa/Blim/SSB2026",
+                      "cannot be achieved in 2027 even with zero catch.",
+                      "% SSB change = SSB2027 vs SSB2026; % TAC change vs the 2025 TAC (970 t);",
+                      "% advice change vs the 2025 advice value (0 t)."))
+```
+
+## Reference points (advice-sheet Table 4)
+
+```{r advice2025-t4}
+advice2025_t4 <- data.frame(
+  Framework = c("MSY approach", "MSY approach",
+                "Precautionary approach", "Precautionary approach", "Precautionary approach"),
+  `Reference point` = c("MSY Btrigger", "Fmsy", "Blim", "Bpa", "Fpa"),
+  Value = c("-", "-", "179,580 t", "269,555 t", "-"),
+  `Technical basis` = c("-",
+                        "Could not be reliably estimated and is therefore not defined",
+                        "Inflection point of a smoother through stock-recruit pairs",
+                        "Blim x exp(1.645 x s), with s = 0.2469; tonnes",
+                        "Could not be reliably estimated and is therefore not defined"),
+  Source = c("ICES (2024)", "ICES (2024)", "ICES (2024)", "ICES (2024)", "ICES (2024)"),
+  check.names = FALSE
+)
+kable(advice2025_t4, caption = "ICES Advice 2025, Table 4 - reference points, values, and technical basis")
+```
+
+# Forecast assumptions
+
+## Recruitment
+
+Recruitment for `r ImY`-`r CtY` is the **geometric mean of the last 10 recruitments**
+(`r termYr-9`-`r termYr`).
+
+```{r recruitment}
+rec.years <- (termYr - 9):termYr
+
+hom.srr <- as.FLSR(trim(hom, year = rec.years))
+model(hom.srr) <- "geomean"
+hom.srr <- try(fmle(hom.srr, control = list(trace = 0)), silent = TRUE)
+if (inherits(hom.srr, "try-error")) {
+  hom.srr <- as.FLSR(trim(hom, year = rec.years)); model(hom.srr) <- "geomean"
+}
+
+rgm <- exp(mean(log(rec(NSHOM)[, ac(rec.years)])))
+params(hom.srr)["a", ] <- rgm
+
+rec_df <- as.data.frame(rec(NSHOM)[, ac(rec.years)])[, c("year", "data")]
+p_rec <- ggplot(rec_df, aes(factor(year), data, group = 1)) +
+  geom_line(colour = "grey60") + geom_point(size = 2) +
+  geom_hline(yintercept = rgm, colour = "#1f6feb", linewidth = 0.8) +
+  annotate("text", x = 1, y = rgm, vjust = -0.6, hjust = 0, colour = "#1f6feb",
+           label = paste0("geomean = ", format(round(rgm), big.mark = ","))) +
+  labs(x = "Year", y = sprintf("Recruitment (age %d)", hom@range[["min"]]),
+       title = paste0(stockcode, " - recruitments used for the geometric mean"))
+save_and_show(p_rec, "proj_recruitment_geomean.png", height = 5)
+```
+
+## Plus-group mean weight
+
+The plus-group (age `r pg`) mean weight is not observed in the most recent years;
+non-positive values are carried forward from the last year with data.
+
+```{r plusgroup-weights, results='asis'}
+fill_pg <- function(stk, slt) {
+  q   <- slot(stk, slt)
+  yrs <- dimnames(q)$year
+  v   <- as.numeric(q[ac(pg), ])
+  good <- which(is.finite(v) & v > 0)
+  changed <- character(0)
+  for (i in seq_along(v)) {
+    if ((!is.finite(v[i]) || v[i] <= 0) && any(good < i)) {
+      src <- max(good[good < i])
+      slot(stk, slt)[ac(pg), yrs[i]] <- v[src]
+      changed <- c(changed, sprintf("%s <- %s (%.4f)", yrs[i], yrs[src], v[src]))
+    }
+  }
+  list(stk = stk, changed = changed)
+}
+
+chg <- list()
+for (slt in c("stock.wt", "catch.wt")) {
+  r <- fill_pg(hom, slt); hom <- r$stk
+  chg[[slt]] <- r$changed
+}
+
+if (length(unlist(chg)) == 0) {
+  cat("*No plus-group weight substitutions were needed.*\n")
+} else {
+  for (slt in names(chg)) if (length(chg[[slt]]))
+    cat("- **", slt, "** age ", pg, ": ", paste(chg[[slt]], collapse = "; "), "\n", sep = "")
+}
+```
+
+## STF settings
+
+```{r stf}
+stf_settings <- data.frame(
+  Setting = c("Projection years", "Weights-at-age", "Selectivity (harvest)",
+              "Maturity / M / spawn timing", "Recruitment", "F rescaling"),
+  Value = c(sprintf("%d (%d-%d)", 3L, ImY, CtY),
+            "mean of last 5 years (arith.mean, na.rm)",
+            "mean of last 1 year",
+            "mean of last 3 years (stf default)",
+            sprintf("geometric mean %d-%d = %s", termYr - 9, termYr, format(round(rgm), big.mark = ",")),
+            "f.rescale = FALSE")
+)
+kable(stf_settings, caption = "Short-term forecast configuration")
+
+hom.proj <- stf(hom,
+                nyears      = 3,
+                wts.nyears  = 5,
+                fbar.nyears = 1,
+                arith.mean  = TRUE,
+                na.rm       = TRUE,
+                f.rescale   = FALSE)
+```
+
+# Catch options
+
+```{r options-list}
+options.l <- setNames(list(
+  fwdControl(data.frame(year = c(ImY, AdY, CtY), quantity = c("catch", "f", "f"),
+                        val = c(ImY.catch, 0.0, 0.0))),
+  fwdControl(data.frame(year = c(ImY, AdY, CtY), quantity = c("catch", "f", "f"),
+                        rel.year = c(NA, ImY, AdY), val = c(ImY.catch, 1, 1))),
+  fwdControl(data.frame(year = c(ImY, AdY, CtY), quantity = c("catch", "catch", "f"),
+                        rel.year = c(NA, NA, AdY), val = c(ImY.catch, ImY.catch * 0.80, 1))),
+  fwdControl(data.frame(year = c(ImY, AdY, CtY), quantity = c("catch", "catch", "f"),
+                        rel.year = c(NA, NA, AdY), val = c(ImY.catch, ImY.catch, 1))),
+  fwdControl(data.frame(year = c(ImY, AdY, CtY), quantity = c("catch", "catch", "f"),
+                        rel.year = c(NA, NA, AdY), val = c(ImY.catch, ImY.catch * 1.25, 1)))
+), c("F = 0",
+     sprintf("F%d = F%d", AdY, ImY),
+     sprintf("Catch%d = Catch%d - 20%%", AdY, ImY),
+     sprintf("Catch%d = Catch%d", AdY, ImY),
+     sprintf("Catch%d = Catch%d + 25%%", AdY, ImY)))
+
+hom.options <- lapply(options.l, function(ctr) fwd(hom.proj, ctrl = ctr, sr = hom.srr))
+names(hom.options) <- names(options.l)
+```
+
+```{r options-summary}
+opt_sum_tbl <- function(stcks) {
+  rows <- lapply(names(stcks), function(nm) {
+    stk <- stcks[[nm]]
+    tsb <- function(y) c(quantSums(stock.wt(stk) * stock.n(stk))[, ac(y), drop = TRUE])
+    data.frame(
+      Rationale        = nm,
+      `Fbar (ImY)`     = c(fbar(stk)[, ac(ImY), drop = TRUE]),
+      `Catch (ImY)`    = c(computeCatch(stk)[, ac(ImY), drop = TRUE]),
+      `SSB (ImY)`      = c(ssb(stk)[, ac(ImY), drop = TRUE]),
+      `TSB (ImY)`      = tsb(ImY),
+      `Fbar (AdY)`     = c(fbar(stk)[, ac(AdY), drop = TRUE]),
+      `Catch (AdY)`    = c(computeCatch(stk)[, ac(AdY), drop = TRUE]),
+      `SSB (AdY)`      = c(ssb(stk)[, ac(AdY), drop = TRUE]),
+      `TSB (AdY)`      = tsb(AdY),
+      `SSB (CtY)`      = c(ssb(stk)[, ac(CtY), drop = TRUE]),
+      `TSB (CtY)`      = tsb(CtY),
+      check.names = FALSE
+    )
+  })
+  out <- do.call(rbind, rows)
+  names(out) <- c("Rationale",
+                  sprintf("Fbar (%d)", ImY), sprintf("Catch (%d)", ImY), sprintf("SSB (%d)", ImY), sprintf("TSB (%d)", ImY),
+                  sprintf("Fbar (%d)", AdY), sprintf("Catch (%d)", AdY), sprintf("SSB (%d)", AdY), sprintf("TSB (%d)", AdY),
+                  sprintf("SSB (%d)", CtY), sprintf("TSB (%d)", CtY))
+  out
+}
+
+opts_sum <- opt_sum_tbl(hom.options)
+write.csv(opts_sum, file.path(FC_DIR, "options - summary.csv"), row.names = FALSE)
+
+opts_show <- opts_sum
+num <- sapply(opts_show, is.numeric)
+opts_show[num] <- lapply(opts_show[num], function(x) round(x, ifelse(max(abs(x), na.rm = TRUE) < 1, 4, 0)))
+kable(opts_show, caption = sprintf("Catch options (ImY = %d, AdY = %d, CtY = %d). Written to %s/options - summary.csv",
+                                   ImY, AdY, CtY, FC_DIR))
+```
+
+```{r options-detail-csv}
+# detailed N- and F-at-age table per option (same layout as model_STF.r)
+tbl.yrs <- ac(ImY:CtY)
+detail_file <- file.path(FC_DIR, "options - details.csv")
+write.table(NULL, file = detail_file, col.names = FALSE, row.names = FALSE)
+for (i in seq_along(hom.options)) {
+  stk <- hom.options[[i]]
+  nums <- stk@stock.n[, tbl.yrs, drop = TRUE]; colnames(nums) <- sprintf("N(%s)", tbl.yrs)
+  fs   <- stk@harvest[, tbl.yrs, drop = TRUE]; colnames(fs)   <- sprintf("F(%s)", tbl.yrs)
+  age.tbl <- cbind(Age = rownames(fs), N = nums, F = fs)
+  sum.tbl <- cbind(Year = tbl.yrs, SSB = ssb(stk)[, tbl.yrs],
+                   F.bar = fbar(stk)[, tbl.yrs], Yield = computeCatch(stk)[, tbl.yrs])
+  pad <- matrix("", nrow = nrow(age.tbl) - nrow(sum.tbl), ncol = ncol(sum.tbl))
+  comb <- cbind(age.tbl, " ", rbind(sum.tbl, pad))
+  write.table(sprintf("%s). %s", letters[i], names(hom.options)[i]), detail_file,
+              append = TRUE, col.names = FALSE, row.names = FALSE, sep = ",")
+  write.table(t(colnames(comb)), detail_file, append = TRUE, col.names = FALSE, row.names = FALSE, sep = ",")
+  write.table(comb, detail_file, append = TRUE, col.names = FALSE, row.names = FALSE, sep = ",")
+  write.table("", detail_file, append = TRUE, col.names = FALSE, row.names = FALSE, sep = ",")
+}
+```
+
+# SSB: assessment and projection
+
+```{r ssb-projection, fig.width=11, fig.height=6}
+# historical SSB from the assessment (point series up to the terminal year)
+ssb_hist <- as.data.frame(ssb(hom))[, c("year", "data")]
+names(ssb_hist) <- c("year", "ssb")
+ssb_hist <- subset(ssb_hist, year <= termYr)
+
+# 95% CI band from the SAM fit, if the fitted object carries one
+ssb_ci <- tryCatch({
+  d <- as.data.frame(FLCore::ssb(NSHOM.sam))
+  keep <- intersect(c("lbnd", "ubnd"), names(d))
+  if (length(keep) == 2) {
+    d <- d[, c("year", "lbnd", "ubnd")]
+    subset(d, year <= termYr)
+  } else NULL
+}, error = function(e) NULL)
+
+# projected SSB per catch option, started at termYr so the lines join the history
+ssb_proj <- do.call(rbind, lapply(names(hom.options), function(nm) {
+  s <- as.data.frame(ssb(hom.options[[nm]]))[, c("year", "data")]
+  names(s) <- c("year", "ssb")
+  s <- subset(s, year >= termYr & year <= CtY)
+  s$option <- nm
+  s
+}))
+ssb_proj$option <- factor(ssb_proj$option, levels = names(hom.options))
+
+p_ssb_proj <- ggplot() +
+  {if (!is.null(ssb_ci))
+     geom_ribbon(data = ssb_ci, aes(year, ymin = lbnd, ymax = ubnd),
+                 fill = "grey85", colour = NA)} +
+  geom_line(data = ssb_hist, aes(year, ssb), colour = "grey20", linewidth = 0.9) +
+  geom_vline(xintercept = termYr + 0.5, colour = "grey60", linetype = "dotted") +
+  geom_hline(yintercept = refpts[["Blim"]], colour = "#d1242f", linetype = "dashed", linewidth = 0.8) +
+  geom_hline(yintercept = refpts[["Bpa"]],  colour = "#bf8700", linetype = "dashed", linewidth = 0.8) +
+  geom_line(data = ssb_proj, aes(year, ssb, colour = option), linewidth = 0.9) +
+  geom_point(data = ssb_proj, aes(year, ssb, colour = option), size = 1.8) +
+  annotate("text", x = min(ssb_hist$year), y = refpts[["Blim"]], label = "Blim",
+           colour = "#d1242f", hjust = 0, vjust = -0.4, size = 3.3) +
+  annotate("text", x = min(ssb_hist$year), y = refpts[["Bpa"]], label = "Bpa",
+           colour = "#bf8700", hjust = 0, vjust = -0.4, size = 3.3) +
+  scale_y_continuous(labels = scales::comma, limits = c(0, NA)) +
+  labs(x = "Year", y = "SSB (t)", colour = "Catch option",
+       title = sprintf("%s - SSB: assessment (to %d) and %d-%d projection", stockcode, termYr, ImY, CtY))
+
+save_and_show(p_ssb_proj, "proj_ssb_blim.png", width = 11, height = 6)
+```
+
+# Relative biomass (category-3 style summary)
+
+Assessment quantities expressed **relative to the time-series mean**, mirroring the
+ICES *cod.27.22-24* (western Baltic cod) advice sheet - where the assessment is
+treated as a category-3 SSB-*trend* index rather than an absolute estimate.
+Recruitment, SSB and harvest rate (catch / SSB) are each divided by their own
+`r NSHOM@range[["minyear"]]`-`r termYr` mean; `High` / `Low` are the 95% SAM
+confidence bounds carried through the same scaling. Written to
+`r file.path(FC_DIR, "assessment summary - relative.csv")`.
+
+```{r relative-biomass}
+sam_tab <- function(fn) {
+  d <- as.data.frame(fn(NSHOM.sam))              # year, value, CV, lbnd, ubnd
+  d[, c("year", "value", "lbnd", "ubnd")]
+}
+ssb_s <- sam_tab(FLCore::ssb); names(ssb_s) <- c("year", "SSB", "SSB_lo", "SSB_hi")
+rec_s <- sam_tab(FLCore::rec); names(rec_s) <- c("year", "Rec", "Rec_lo", "Rec_hi")
+
+cat_s <- as.data.frame(catch(NSHOM))[, c("year", "data")]   # observed catch (t)
+names(cat_s) <- c("year", "Catch_t")
+
+rel <- Reduce(function(a, b) merge(a, b, by = "year"), list(ssb_s, rec_s, cat_s))
+rel <- rel[rel$year <= termYr, ]
+rel$HR <- rel$Catch_t / rel$SSB                              # harvest rate
+
+ssb_bar <- mean(rel$SSB); rec_bar <- mean(rel$Rec); hr_bar <- mean(rel$HR)
+
+rel_out <- data.frame(
+  Year          = rel$year,
+  Rel_SSB       = rel$SSB    / ssb_bar,
+  Rel_SSB_Low   = rel$SSB_lo / ssb_bar,
+  Rel_SSB_High  = rel$SSB_hi / ssb_bar,
+  Rel_Rec       = rel$Rec    / rec_bar,
+  Rel_Rec_Low   = rel$Rec_lo / rec_bar,
+  Rel_Rec_High  = rel$Rec_hi / rec_bar,
+  Rel_HarvestRate = rel$HR / hr_bar,
+  SSB_t         = rel$SSB,
+  Rec_thousands = rel$Rec / 1000,
+  Catch_t       = rel$Catch_t
+)
+rel_out[-1] <- lapply(rel_out[-1], round, 4)
+write.csv(rel_out, file.path(FC_DIR, "assessment summary - relative.csv"), row.names = FALSE)
+
+# companion file: the reference levels and the biomass ref points on the same scale
+ref_levels <- data.frame(
+  Quantity = c("mean SSB (t)", "mean recruitment (thousands)",
+               "mean harvest rate (catch/SSB)", "Blim (t)", "Bpa (t)",
+               "Blim relative to mean SSB", "Bpa relative to mean SSB", "Years"),
+  Value = c(round(ssb_bar), round(rec_bar / 1000), round(hr_bar, 4),
+            refpts[["Blim"]], refpts[["Bpa"]],
+            round(refpts[["Blim"]] / ssb_bar, 4), round(refpts[["Bpa"]] / ssb_bar, 4),
+            sprintf("%d-%d", min(rel$year), termYr))
+)
+write.csv(ref_levels, file.path(FC_DIR, "assessment summary - relative reference levels.csv"),
+          row.names = FALSE)
+
+kable(rel_out[, c("Year", "Rel_SSB", "Rel_SSB_Low", "Rel_SSB_High",
+                  "Rel_Rec", "Rel_HarvestRate", "SSB_t", "Catch_t")],
+      caption = sprintf(paste0("Relative assessment summary, %d-%d ",
+                               "(mean SSB = %s t; Blim = %s of the mean, Bpa = %s). ",
+                               "Full table + reference levels in %s/"),
+                        min(rel$year), termYr, format(round(ssb_bar), big.mark = ","),
+                        round(refpts[["Blim"]] / ssb_bar, 2),
+                        round(refpts[["Bpa"]]  / ssb_bar, 2), FC_DIR))
+```
+
+```{r relative-biomass-plot, fig.width=10, fig.height=9}
+blim_rel <- refpts[["Blim"]] / ssb_bar
+bpa_rel  <- refpts[["Bpa"]]  / ssb_bar
+
+base_rel <- list(
+  geom_hline(yintercept = 1, colour = "grey55", linewidth = 0.5),
+  theme_bw(base_size = 11),
+  labs(x = NULL)
+)
+
+p_rs <- ggplot(rel_out, aes(Year, Rel_SSB)) +
+  geom_ribbon(aes(ymin = Rel_SSB_Low, ymax = Rel_SSB_High), fill = "#1f6feb", alpha = 0.15) +
+  geom_line(colour = "#1f6feb", linewidth = 0.9) +
+  geom_hline(yintercept = blim_rel, colour = "#d1242f", linetype = "dashed", linewidth = 0.8) +
+  geom_hline(yintercept = bpa_rel,  colour = "#bf8700", linetype = "dashed", linewidth = 0.8) +
+  annotate("text", x = min(rel_out$Year), y = blim_rel, label = "Blim", colour = "#d1242f",
+           hjust = 0, vjust = -0.4, size = 3.2) +
+  annotate("text", x = min(rel_out$Year), y = bpa_rel, label = "Bpa", colour = "#bf8700",
+           hjust = 0, vjust = -0.4, size = 3.2) +
+  base_rel + ylim(0, NA) +
+  labs(y = "Relative SSB", title = paste0(stockcode, " - assessment relative to the ",
+       min(rel_out$Year), "-", termYr, " mean"),
+       subtitle = "Ribbon = 95% SAM CI; grey line = time-series mean (= 1)")
+
+p_rr <- ggplot(rel_out, aes(Year, Rel_Rec)) +
+  geom_ribbon(aes(ymin = Rel_Rec_Low, ymax = Rel_Rec_High), fill = "#2da44e", alpha = 0.15) +
+  geom_line(colour = "#2da44e", linewidth = 0.9) +
+  base_rel + ylim(0, NA) + labs(y = "Relative recruitment (age 1)")
+
+p_rh <- ggplot(rel_out, aes(Year, Rel_HarvestRate)) +
+  geom_line(colour = "#8250df", linewidth = 0.9) +
+  base_rel + ylim(0, NA) + labs(y = "Relative harvest rate (catch / SSB)", x = "Year")
+
+save_and_show(p_rs / p_rr / p_rh, "proj_relative_summary.png", width = 10, height = 9)
+```
+
+# Yield and SSB against F
+
+```{r fsweep}
+fmult.targs <- seq(0, 1, by = 0.002)
+mult.opts.l <- lapply(fmult.targs, function(fm)
+  fwdControl(data.frame(year = c(ImY, AdY, CtY), quantity = c("catch", "f", "f"),
+                        val = c(ImY.catch, fm, fm))))
+names(mult.opts.l) <- sprintf("Fmult(%d) = %5.3f", ImY, fmult.targs)
+
+hom.mult.opts <- lapply(mult.opts.l, function(ctr) fwd(hom.proj, ctrl = ctr, sr = hom.srr))
+names(hom.mult.opts) <- names(mult.opts.l)
+
+mult_sum <- opt_sum_tbl(hom.mult.opts)
+write.csv(mult_sum, file.path(FC_DIR, "multi-options - summary.csv"), row.names = FALSE)
+```
+
+```{r fsweep-plot, fig.width=12, fig.height=5}
+fbar_col  <- sprintf("Fbar (%d)", AdY)
+catch_col <- sprintf("Catch (%d)", AdY)
+ssb_col   <- sprintf("SSB (%d)", CtY)
+
+named <- opts_sum %>%
+  transmute(Rationale, fbar = .data[[fbar_col]], catch = .data[[catch_col]], ssb = .data[[ssb_col]])
+
+p_y <- ggplot(mult_sum, aes(.data[[fbar_col]], .data[[catch_col]])) +
+  geom_line(colour = "grey50") +
+  geom_point(data = named, aes(fbar, catch, colour = Rationale), size = 2.5) +
+  labs(x = sprintf("Fbar %d", AdY), y = sprintf("Catch %d (t)", AdY), colour = NULL, title = "Yield vs F") +
+  theme(legend.position = "none")
+
+p_s <- ggplot(mult_sum, aes(.data[[fbar_col]], .data[[ssb_col]])) +
+  geom_line(colour = "grey50") +
+  geom_point(data = named, aes(fbar, ssb, colour = Rationale), size = 2.5) +
+  labs(x = sprintf("Fbar %d", AdY), y = sprintf("SSB %d (t)", CtY), colour = NULL, title = "SSB vs F")
+
+save_and_show(p_y + p_s + plot_layout(widths = c(1, 1.4)),
+              "proj_yield_ssb_vs_f.png", width = 12, height = 5)
+```
+
+# Forecast input table
+
+```{r input-table}
+input.tbl.list <- list(N = "stock.n", M = "m", Mat = "mat", PF = "harvest.spwn",
+                       PM = "m.spwn", SWt = "stock.wt", Sel = "harvest", CWt = "catch.wt")
+input_file <- file.path(FC_DIR, "options - input.csv")
+write.table(NULL, file = input_file, col.names = FALSE, row.names = FALSE)
+for (yr in c(ImY, AdY, CtY)) {
+  col.dat <- sapply(input.tbl.list, function(slt) slot(hom.proj, slt)[, ac(yr), drop = TRUE])
+  write.table(yr, input_file, col.names = FALSE, row.names = FALSE, append = TRUE, sep = ",")
+  write.table(t(c("Age", colnames(col.dat))), input_file, col.names = FALSE, row.names = FALSE, append = TRUE, sep = ",")
+  write.table(col.dat, input_file, col.names = FALSE, row.names = TRUE, append = TRUE, sep = ",", na = "-")
+  write.table("", input_file, col.names = FALSE, row.names = FALSE, append = TRUE, sep = ",")
+}
+
+imy_in <- sapply(input.tbl.list, function(slt) slot(hom.proj, slt)[, ac(ImY), drop = TRUE])
+kable(round(as.data.frame(imy_in), 4),
+      caption = sprintf("Forecast inputs at age, %d (full %d-%d table in %s/options - input.csv)",
+                        ImY, ImY, CtY, FC_DIR))
+```
+
+```{r session, include=FALSE}
+writeLines(capture.output(sessionInfo()), file.path(FC_DIR, "sessionInfo.txt"))
+```

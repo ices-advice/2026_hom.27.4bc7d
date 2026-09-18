@@ -1,0 +1,1166 @@
+---
+title: "North Sea Horse Mackerel (hom.27.4bc7d) - Assessment Report"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+params:
+  model_file: "model/model_benchmark.RData"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    df_print: kable
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+
+library(icesTAF)
+library(FLCore)
+library(FLSAM)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(knitr)
+library(patchwork)
+
+theme_set(theme_bw())
+
+stockcode <- "hom.27.4bc7d" # repo/stock identifier - not year-dependent, safe to fix
+
+# each model run gets its own figures subfolder, keyed off model_file's name
+# (e.g. "benchmark", "obsvarpool", "final") - report.R renders this Rmd once
+# per model/*.RData into a shared report/ tree, and without this the runs
+# would overwrite each other's same-named PNGs (e.g. stock_summary.png)
+run_name <- sub("^model_", "", tools::file_path_sans_ext(basename(params$model_file)))
+FIG_DIR <- file.path("report/figures", run_name)
+mkdir("report")
+mkdir(FIG_DIR)
+
+# Saves a ggplot (or a base/lattice plot passed as a zero-arg function) to
+# FIG_DIR at print resolution, then embeds that exact file in the report -
+# this is what keeps "all images in one folder, at good resolution" true
+# instead of relying on knitr's per-chunk figure cache.
+save_and_show <- function(p, filename, width = 10, height = 6.5, dpi = 300) {
+  path <- file.path(FIG_DIR, filename)
+  if (inherits(p, "ggplot")) {
+    ggsave(path, plot = p, width = width, height = height, dpi = dpi, bg = "white")
+  } else {
+    png(path, width = width, height = height, units = "in", res = dpi, bg = "white")
+    on.exit(dev.off())
+    p()
+  }
+  knitr::include_graphics(path)
+}
+
+# FLSAM accessors on an FLSAM object return a data.frame with year/value/lbnd/ubnd
+# (confidence bounds); on a plain FLStock they return an FLQuant. This helper
+# normalises either into a common data.frame shape.
+as_series <- function(x, name) {
+  if (is.null(x)) return(NULL)
+  df <- if (is.data.frame(x)) x else as.data.frame(x)
+  names(df) <- tolower(names(df))
+  if (!"value" %in% names(df)) {
+    if ("data" %in% names(df)) df$value <- df$data
+    else if ("estimate" %in% names(df)) df$value <- df$estimate
+  }
+  if (!"year" %in% names(df) || !"value" %in% names(df)) {
+    warning("as_series: unexpected shape for ", name, " - skipping")
+    return(NULL)
+  }
+  df$year <- as.numeric(df$year)
+  if (!"lbnd" %in% names(df)) df$lbnd <- NA
+  if (!"ubnd" %in% names(df)) df$ubnd <- NA
+  df$series <- name
+  df[, c("year", "value", "lbnd", "ubnd", "series")]
+}
+```
+
+```{r load}
+load(params$model_file, verbose = FALSE) # NSHOM, NSHOM.tun, NSHOM.sam, NSHOM.ctrl, NSHOM.retro, NSHOM.loo
+load("data/input.RData", verbose = FALSE)        # CAA, WAA, IBTS, CPUE, natmort, mat
+
+ages    <- as.numeric(colnames(CAA))
+minAge  <- min(ages)
+maxAge  <- max(ages)
+years_all <- as.numeric(rownames(CAA))
+startYr <- min(years_all)
+endYr   <- max(years_all)          # last year with catch data
+currentYear <- endYr               # the "current" year this report describes
+
+rage       <- NSHOM@range[["min"]]
+pg         <- NSHOM@range[["plusgroup"]]
+fbar_range <- NSHOM@range[c("minfbar", "maxfbar")]
+
+# forecast years, mirroring model_STF.r's derivation from the same terminal year
+ImY <- endYr + 1
+AdY <- endYr + 2
+CtY <- endYr + 3
+```
+
+# `r NSHOM@name` (`r stockcode`)
+
+# Input data
+
+## Catch, weight and length at age
+
+```{r caa-waa-tables}
+CAA_tab <- as.data.frame(t(CAA))
+CAA_tab$age <- rownames(CAA_tab)
+write.csv(CAA_tab, "report/CAA_tab.csv", row.names = FALSE)
+
+WAA_tab <- as.data.frame(t(WAA))
+WAA_tab$age <- rownames(WAA_tab)
+write.csv(WAA_tab, "report/WAA_tab.csv", row.names = FALSE)
+```
+
+```{r caa-bubble}
+CAA_long <- as.data.frame(CAA) %>%
+  mutate(year = as.numeric(rownames(CAA))) %>%
+  pivot_longer(-year, names_to = "age", values_to = "catch") %>%
+  mutate(age = as.numeric(age))
+
+p_caa <- ggplot(CAA_long, aes(year, age, size = catch)) +
+  geom_point(shape = 21, alpha = 0.5, na.rm = TRUE) +
+  scale_size_area(max_size = 10, name = "Catch (thousands)") +
+  scale_x_continuous(breaks = scales::breaks_pretty()) +
+  labs(x = "Year", y = "Age", title = paste(stockcode, "- catch at age (numbers)"))
+
+save_and_show(p_caa, "catch_N_at_age.png")
+```
+
+```{r caa-internal-consistency}
+save_and_show(
+  function() {
+    library(latticeExtra)
+    print(plot(FLIndex(index = NSHOM@catch.n), type = "internal"))
+  },
+  "catch_at_age_internal_consistency.png"
+)
+```
+
+```{r waa-plot}
+WAA_long <- as.data.frame(WAA) %>%
+  mutate(year = as.numeric(rownames(WAA))) %>%
+  pivot_longer(-year, names_to = "age", values_to = "weight") %>%
+  mutate(age = factor(as.numeric(age)))
+
+p_waa <- ggplot(WAA_long, aes(year, weight, colour = age)) +
+  geom_line() + geom_point(size = 0.8) +
+  labs(x = "Year", y = "Weight (kg)", colour = "Age",
+       title = "Mean weight at age (catch)")
+
+save_and_show(p_waa, "mean_weight_at_age.png")
+```
+
+```{r lena-parse}
+# Generic parser for the repeated "<title> by Area" blocks in the InterCatch
+# CatchAndSampleDataTables.txt export. Table length is detected from the file
+# itself (first blank/non-tabular line) rather than assumed from a fixed age
+# range, and the "All periods" (or a given quarter) sub-table is located by
+# matching its preceding "For Period" line rather than a hardcoded position -
+# quarterly sub-tables 1-4 followed by the combined "All periods" table is
+# the standard InterCatch export order, kept here only as a fallback.
+extract_area_table <- function(lines, title, period = "All periods", fallback_occurrence = 5) {
+  starts <- grep(title, lines, fixed = TRUE)
+  if (length(starts) == 0) return(NULL)
+  sel <- starts[vapply(starts, function(i) {
+    ctx <- lines[max(1, i - 6):max(1, i - 1)]
+    any(grepl(paste0("For Period\\t", period), ctx))
+  }, logical(1))]
+  start <- if (length(sel) > 0) sel[1] else starts[min(fallback_occurrence, length(starts))]
+
+  header <- strsplit(lines[start + 3], "\t")[[1]]
+  body <- character(0)
+  j <- start + 4
+  while (j <= length(lines) && grepl("\t", lines[j]) && nchar(trimws(lines[j])) > 0) {
+    body <- c(body, lines[j])
+    j <- j + 1
+  }
+  if (length(body) == 0) return(NULL)
+
+  rows <- strsplit(body, "\t")
+  age  <- vapply(rows, `[`, character(1), 1)
+  vals <- lapply(rows, function(r) as.numeric(gsub(",", "", r[-1])))
+  df <- as.data.frame(do.call(rbind, vals))
+  names(df) <- header[-1]
+  df$age <- as.numeric(age)
+  df
+}
+
+catch_file <- list.files(taf.data.path(), pattern = "CatchAndSampleDataTables", full.names = TRUE)[1]
+catch_lines <- scan(catch_file, what = character(), sep = "\n", quiet = TRUE)
+
+pad_ages <- function(df) {
+  full <- data.frame(age = minAge:maxAge)
+  out  <- left_join(full, df, by = "age")
+  out[is.na(out)] <- 0
+  out$year <- currentYear
+  out
+}
+
+lena_area  <- pad_ages(extract_area_table(catch_lines, "Mean Length at Age by Area"))
+canum_area <- pad_ages(extract_area_table(catch_lines, "Catch Numbers at Age by Area"))
+weca_area  <- pad_ages(extract_area_table(catch_lines, "Mean Weight at Age by Area"))
+
+write.csv(lena_area,  "report/lena_area.csv",  row.names = FALSE)
+write.csv(canum_area, "report/canum_area.csv", row.names = FALSE)
+write.csv(weca_area,  "report/weca_area.csv",  row.names = FALSE)
+
+area_cols <- setdiff(names(lena_area), c("age", "year", "Total"))
+```
+
+```{r lena-plot}
+lena_long <- lena_area %>%
+  pivot_longer(all_of(area_cols), names_to = "area", values_to = "length") %>%
+  filter(length > 0)
+
+p_lena <- ggplot(lena_long, aes(age, length, colour = area)) +
+  geom_line() + geom_point() +
+  labs(x = "Age", y = "Mean length (cm)", colour = "Area",
+       title = paste0("Mean length at age (", currentYear, ")"))
+
+save_and_show(p_lena, "mean_length_at_age.png")
+```
+
+## Catch curves and total mortality by cohort
+
+```{r catch-curves-setup}
+# a cohort needs several years of observed ages to fit a reliable slope;
+# 8 years mirrors the cutoff used in past editions of this report (which used
+# a fixed calendar year), kept here as a relative offset so it scales forward
+minCohortSpan  <- 8
+startYearCohort <- startYr
+endYearCohort   <- endYr - minCohortSpan
+stkCohort <- FLCohort(log(NSHOM@catch.n))
+```
+
+```{r catch-curves-plot}
+save_and_show(
+  function() print(FLCore::plot(stkCohort[, as.character(startYearCohort:endYearCohort)])),
+  "catch_curves_by_cohort.png"
+)
+```
+
+```{r catch-curves-slope}
+coh  <- startYearCohort:endYearCohort
+data_coh <- as.data.frame(stkCohort)
+
+slope_df <- bind_rows(lapply(coh, function(cy) {
+  datsel <- data_coh[data_coh$cohort == cy & !is.na(data_coh$data) & data_coh$data > 0, ]
+  if (nrow(datsel) < 2) return(NULL)
+  fit <- lm(log(data) ~ age, data = datsel)
+  data.frame(cohort = cy, Z = -coef(fit)[["age"]])
+}))
+
+p_slope <- ggplot(slope_df, aes(cohort, Z)) +
+  geom_line() + geom_point() +
+  expand_limits(y = 0) +
+  labs(x = "Cohort", y = "Total mortality Z",
+       title = "Total mortality by cohort (catch curve slope)")
+
+save_and_show(p_slope, "catch_curves_by_cohort_slope.png")
+write.csv(drop(stkCohort), "report/catch_at_age_cohort.csv", row.names = FALSE)
+```
+
+## Commercial CPUE index
+
+```{r cpue-plot}
+load(taf.data.path("commercial_CPUE.rda"), verbose = FALSE)
+
+p_cpue <- ggplot(com_CPUE, aes(Year, Estimate)) +
+  geom_ribbon(aes(ymin = Lower, ymax = Upper), fill = "grey70", colour = "darkgrey", alpha = 0.5) +
+  geom_line(linetype = 2, na.rm = TRUE) +
+  geom_point(na.rm = TRUE) +
+  labs(x = "Year", y = "CPUE", title = "PFA standardized commercial CPUE")
+
+save_and_show(p_cpue, "commercial_cpue.png")
+```
+
+## IBTS/CGFS SSB index: standardization comparison
+
+```{r survey-index-compare, results='asis'}
+# fixed to the 2025 assessment's re-standardization (2024 data year) - copied directly
+# from that repo's boot/data/delta-LN_SSB.rda, not regenerated here. Update this file
+# (and its name) when a newer prior-vintage comparison is wanted.
+prev_std_file <- taf.data.path("delta-LN_SSB_2024_data_year.rda")
+
+if (file.exists(prev_std_file)) {
+  prev_env <- new.env()
+  load(prev_std_file, envir = prev_env)
+  prev_idx <- data.frame(
+    year  = as.numeric(rownames(prev_env$SI.dln_SSB$idx)),
+    value = as.numeric(prev_env$SI.dln_SSB$idx[, 1])
+  )
+  prevYr <- max(prev_idx$year)
+
+  ssb_env <- new.env()
+  load(taf.data.path("delta-LN_SSB.Rda"), envir = ssb_env)
+  cur_idx <- data.frame(
+    year = as.numeric(rownames(ssb_env$SI.dln_SSB$idx)),
+    value = as.numeric(ssb_env$SI.dln_SSB$idx[, 1])
+  )
+
+  std_labels <- c(paste0("Standardized through ", prevYr, " (2024 data year, 2025 assessment)"),
+                  paste("Standardized through", endYr))
+
+  std_df <- bind_rows(
+    prev_idx %>% mutate(standardization = std_labels[1]),
+    cur_idx  %>% mutate(standardization = std_labels[2])
+  )
+  std_df$standardization <- factor(std_df$standardization, levels = std_labels)
+
+  std_pal <- setNames(c("#8a94a6", "#1f6feb"), std_labels)
+
+  pct_diff_df <- inner_join(prev_idx, cur_idx, by = "year", suffix = c("_prev", "_cur")) %>%
+    mutate(pct_diff = round((value_cur - value_prev) / value_prev * 100, 2))
+
+  p_std_top <- ggplot(std_df, aes(year, value, colour = standardization)) +
+    geom_line(linewidth = 0.9) +
+    geom_point(size = 1.8) +
+    scale_colour_manual(values = std_pal) +
+    scale_y_log10(labels = scales::label_comma()) +
+    labs(x = NULL, y = "SSB index\n(log scale)", colour = NULL,
+         title = "IBTS Q3 + CGFS Q4 SSB index: standardization comparison") +
+    theme_bw(base_size = 12) +
+    theme(legend.position = "top", plot.title = element_text(face = "bold", size = 11),
+          axis.text.x = element_blank(), axis.ticks.x = element_blank())
+
+  p_std_bot <- ggplot(pct_diff_df, aes(year, pct_diff)) +
+    geom_col(fill = std_pal[[2]], width = 0.7) +
+    geom_hline(yintercept = 0, colour = "grey30", linewidth = 0.4) +
+    labs(x = "Year", y = paste0("% change\nvs ", prevYr, " fit")) +
+    theme_bw(base_size = 12)
+
+  p_std <- p_std_top / p_std_bot + plot_layout(heights = c(2.2, 1))
+  save_and_show(p_std, "ssb_index_standardization_comparison.png", height = 7.5)
+}
+```
+
+## Commercial catch overview
+
+```{r catch-tables}
+table_marks <- grep("^TABLE", catch_lines)
+
+parse_table_block <- function(lines, block_start, block_end, stock) {
+  block  <- lines[block_start:block_end]
+  rows   <- block[grepl(stock, block, fixed = TRUE)]
+  header <- strsplit(block[which(grepl("\t", block))[1]], "\t")[[1]]
+  vals   <- strsplit(rows, "\t")
+  df <- as.data.frame(do.call(rbind, vals), stringsAsFactors = FALSE)
+  names(df) <- header
+  df
+}
+
+catch_raw_tab <- parse_table_block(catch_lines, table_marks[1], table_marks[2] - 1, stockcode)
+
+select_df <- catch_raw_tab %>%
+  mutate(CatchCategory = recode(CatchCategory,
+                                 "BMS landing" = "Landings",
+                                 "Logbook Registered Discard" = "Discards"),
+         catch = as.numeric(CATON) / 1000) %>%
+  select(country = Country, year = Year, category = CatchCategory,
+         area = Area, season = Season, catch)
+
+uk_labels <- grep("^UK", unique(select_df$country), value = TRUE)
+if (length(uk_labels) > 1) {
+  uk_catches <- select_df %>%
+    filter(country %in% uk_labels) %>%
+    group_by(category, area, season) %>%
+    summarise(catch = sum(catch), .groups = "drop") %>%
+    mutate(country = "UK", year = currentYear)
+  select_df <- select_df %>%
+    filter(!country %in% uk_labels) %>%
+    bind_rows(uk_catches)
+}
+
+write.csv(select_df, "report/catch_area_country.csv", row.names = FALSE)
+```
+
+```{r catch-by-quarter-area}
+p1 <- ggplot(select_df, aes(season, fill = area, weight = catch)) +
+  geom_bar(position = "stack", width = 0.75) +
+  labs(x = "Quarter", y = "Catch (tonnes)", title = "Catch by quarter and area")
+save_and_show(p1, "catch_quarter_area.png")
+```
+
+```{r catch-by-area-category}
+p2 <- ggplot(select_df, aes(area, fill = category, weight = catch)) +
+  geom_bar(position = "stack", width = 0.75) +
+  labs(x = "Area", y = "Catch (tonnes)", title = "Catch by area and category")
+save_and_show(p2, "catch_area_category.png")
+```
+
+```{r catch-by-country-quarter}
+p3 <- ggplot(select_df, aes(country, fill = season, weight = catch)) +
+  geom_bar(position = "stack", width = 0.75) +
+  labs(x = "Country", y = "Catch (tonnes)", fill = "Quarter",
+       title = "Catch by country and quarter") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+save_and_show(p3, "catch_country_quarter.png")
+```
+
+```{r catch-by-category-country}
+p4 <- ggplot(select_df, aes(category, fill = country, weight = catch)) +
+  geom_bar(position = "stack", width = 0.75) +
+  labs(x = "Category", y = "Catch (tonnes)", title = "Catch category per country")
+save_and_show(p4, "catch_category_country.png")
+
+p5 <- p4 + facet_wrap(~ area, nrow = 1) + labs(title = "Catch by area, category and country") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+save_and_show(p5, "catch_area_category_country.png", width = 12)
+
+p6 <- p4 + facet_wrap(~ area + season, nrow = 1) +
+  labs(title = "Catch by area, quarter, category and country") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+save_and_show(p6, "catch_area_quarter_category_country.png", width = 14)
+```
+
+```{r catch-country-area-table}
+tab <- select_df %>%
+  group_by(area, country) %>%
+  summarise(catch = round(sum(catch)), .groups = "drop") %>%
+  pivot_wider(names_from = country, values_from = catch, values_fill = 0)
+
+kable(tab, caption = paste("Catch (tonnes) by area and country,", currentYear))
+```
+
+## Landings and discards by fleet type
+
+```{r fleet-type}
+fleet_df <- catch_raw_tab %>%
+  mutate(catch_t = as.numeric(CATON) / 1000) %>%
+  separate(Fleet, into = c("Gear", "Species"), sep = "_", extra = "drop", fill = "right") %>%
+  mutate(assignment = case_when(
+    Gear %in% c("OTB", "TBB") ~ "Bottom trawl",
+    Gear %in% c("OTM")        ~ "Pelagic trawl",
+    Gear %in% c("SSC")        ~ "Seine",
+    TRUE                      ~ "Other/undefined gears"
+  ))
+
+fleet_summary <- fleet_df %>%
+  mutate(catch_class = ifelse(CatchCategory %in% c("Landings", "BMS landing"), "Landings", "Discards")) %>%
+  group_by(assignment, catch_class) %>%
+  summarise(catch_t = sum(catch_t, na.rm = TRUE), .groups = "drop") %>%
+  group_by(catch_class) %>%
+  mutate(portion = round(catch_t / sum(catch_t) * 100, 1))
+
+p_fleet <- ggplot(fleet_summary, aes(assignment, catch_t, fill = assignment)) +
+  geom_col() +
+  facet_wrap(~catch_class, scales = "free_y") +
+  labs(x = NULL, y = "Catch (tonnes)", title = "Landings and discards by fleet/gear type") +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1), legend.position = "none")
+
+save_and_show(p_fleet, "landings_discards_by_fleet.png")
+```
+
+## TAC and catch utilisation
+
+```{r tac-data}
+hist_TAC   <- read.csv(taf.data.path("hist_TAC.csv"))
+recent_TAC <- read.csv(taf.data.path("tac_recent.csv"))
+tac_all    <- bind_rows(hist_TAC, recent_TAC) %>% distinct(year, country, .keep_all = TRUE)
+
+tac_current_total <- tac_all %>% filter(country == "all", year == currentYear) %>% pull(TAC)
+```
+
+```{r tac-country-plot, results='asis'}
+tac_country <- tac_all %>%
+  filter(year == currentYear, country != "all") %>%
+  mutate(country = recode(country, "United Kingdom" = "UK", "Netherlands" = "NL")) %>%
+  select(country, TAC)
+
+use_by_country <- select_df %>%
+  mutate(country = recode(country, "United Kingdom" = "UK", "Netherlands" = "NL")) %>%
+  group_by(country) %>%
+  summarise(TAC_use = sum(catch), .groups = "drop")
+
+tac_use_df <- full_join(tac_country, use_by_country, by = "country") %>%
+  mutate(across(c(TAC, TAC_use), ~ replace_na(., 0))) %>%
+  pivot_longer(c(TAC, TAC_use), names_to = "type", values_to = "tonnes")
+
+if (nrow(tac_country) > 0) {
+  p_tac_country <- ggplot(tac_use_df, aes(country, tonnes, fill = type)) +
+    geom_col(position = "dodge") +
+    labs(x = "Country", y = "Tonnes", fill = NULL,
+         title = paste(currentYear, "TAC utilisation by country"))
+  save_and_show(p_tac_country, "catch_tac_country.png")
+}
+```
+
+```{r tac-historic-plot}
+catch_series_file <- list.files(taf.data.path(), pattern = "all_serie", full.names = TRUE)[1]
+all_catches <- read.csv(catch_series_file, check.names = FALSE)
+
+tac_all_country <- tac_all %>% filter(country == "all") %>% select(year, TAC)
+
+tac_util_df <- all_catches %>%
+  select(year, total) %>%
+  full_join(tac_all_country, by = "year") %>%
+  filter(year >= startYr) %>%
+  arrange(year)
+
+p_tac_hist <- ggplot(tac_util_df, aes(year)) +
+  geom_col(aes(y = total), fill = "grey70") +
+  geom_step(aes(y = TAC), colour = "black", linewidth = 0.9, direction = "mid", na.rm = TRUE) +
+  labs(x = "Year", y = "Catch / TAC (tonnes)",
+       title = "Catch and TAC over time")
+
+save_and_show(p_tac_hist, "historic_catch_tac.png")
+```
+
+# Assessment outputs
+
+## Stock summary
+
+```{r stock-summary-data}
+summary_list <- list(
+  SSB          = tryCatch(ssb(NSHOM.sam),   error = function(e) ssb(NSHOM)),
+  `Mean F`     = tryCatch(fbar(NSHOM.sam),  error = function(e) fbar(NSHOM)),
+  Recruitment  = tryCatch(rec(NSHOM.sam),   error = function(e) rec(NSHOM)),
+  Catch        = as.data.frame(catch(NSHOM))
+)
+
+summary_df <- bind_rows(Map(as_series, summary_list, names(summary_list)))
+summary_df$series <- factor(summary_df$series, levels = names(summary_list))
+```
+
+```{r stock-summary-plot, fig.width=10, fig.height=7}
+p_summary <- ggplot(summary_df, aes(year, value)) +
+  geom_ribbon(aes(ymin = lbnd, ymax = ubnd), fill = "steelblue", alpha = 0.25, na.rm = TRUE) +
+  geom_line(colour = "steelblue4", linewidth = 0.8) +
+  facet_wrap(~series, scales = "free_y", ncol = 2) +
+  labs(x = "Year", y = NULL,
+       title = paste(stockcode, "- stock summary")) +
+  expand_limits(y = 0)
+
+save_and_show(p_summary, "stock_summary.png")
+```
+
+## Assessment comparison: this year vs. last year
+
+```{r assess-compare-data}
+# Finds the most recent sibling "<year>_<stockcode>_assessment" repo (one level
+# up, alongside this one) with an earlier year than the current repo, so this
+# section works unmodified in future editions rather than pointing at a fixed year.
+find_previous_assessment <- function(stockcode) {
+  cur_dir  <- normalizePath(".")
+  cur_year <- suppressWarnings(as.numeric(sub("^([0-9]{4}).*", "\\1", basename(cur_dir))))
+  sibs     <- list.dirs(dirname(cur_dir), recursive = FALSE, full.names = TRUE)
+  cand     <- sibs[grepl(paste0("^[0-9]{4}_", stockcode, "_assessment$"), basename(sibs))]
+  cand_yr  <- suppressWarnings(as.numeric(sub("^([0-9]{4}).*", "\\1", basename(cand))))
+  keep     <- !is.na(cand_yr) & !is.na(cur_year) & cand_yr < cur_year
+  if (!any(keep)) return(NULL)
+  cand[keep][which.max(cand_yr[keep])]
+}
+
+prev_dir  <- find_previous_assessment(stockcode)
+prev_base <- if (!is.null(prev_dir)) file.path(prev_dir, "model", "model_base.RData") else NULL
+have_prev <- !is.null(prev_base) && file.exists(prev_base)
+
+if (have_prev) {
+  prev_env <- new.env()
+  load(prev_base, envir = prev_env)
+  prevYr_assess <- dims(prev_env$NSHOM)$maxyear
+
+  prev_label <- paste("Assessed through", prevYr_assess)
+  cur_label  <- paste("Assessed through", endYr)
+  # shared palette for every previous-vs-current comparison figure below
+  compare_pal <- setNames(c("#8a94a6", "#1f6feb"), c(prev_label, cur_label))
+
+  prev_summary <- list(
+    SSB         = tryCatch(ssb(prev_env$NSHOM.sam),  error = function(e) ssb(prev_env$NSHOM)),
+    `Mean F`    = tryCatch(fbar(prev_env$NSHOM.sam), error = function(e) fbar(prev_env$NSHOM)),
+    Recruitment = tryCatch(rec(prev_env$NSHOM.sam),  error = function(e) rec(prev_env$NSHOM))
+  )
+  prev_df <- bind_rows(Map(as_series, prev_summary, names(prev_summary))) %>%
+    mutate(assessment = prev_label)
+
+  cur_df <- summary_df %>%
+    filter(series != "Catch") %>%
+    mutate(assessment = cur_label)
+
+  assess_compare_df <- bind_rows(prev_df, cur_df)
+  assess_compare_df$series     <- factor(assess_compare_df$series, levels = c("SSB", "Mean F", "Recruitment"))
+  assess_compare_df$assessment <- factor(assess_compare_df$assessment, levels = c(prev_label, cur_label))
+
+  # the previous assessment's terminal year is the one most exposed to revision
+  # once another year of data comes in - this is the comparison of interest
+  overlap_yr <- prevYr_assess
+}
+```
+
+```{r assess-compare-plot, results='asis'}
+if (have_prev) {
+  p_assess_compare <- ggplot(assess_compare_df, aes(year, value, colour = assessment)) +
+    geom_vline(xintercept = overlap_yr, linetype = "dashed", colour = "grey60") +
+    geom_line(linewidth = 0.8) +
+    geom_point(size = 1.2) +
+    scale_colour_manual(values = compare_pal) +
+    facet_wrap(~series, scales = "free_y", ncol = 1) +
+    labs(x = "Year", y = NULL, colour = NULL,
+         title = paste0(stockcode, " - assessment comparison"),
+         subtitle = paste0("Dashed line marks ", overlap_yr,
+                            ", the previous assessment's terminal year")) +
+    theme_bw(base_size = 12) +
+    theme(legend.position = "top")
+
+  save_and_show(p_assess_compare, "assessment_comparison.png", height = 9)
+}
+```
+
+The figures below repeat, for the base run, the previous-vs-current comparison
+that `model_comparison.Rmd` produces across all candidate runs: harvest pattern,
+stock-recruitment and SAM residuals here; observation variance, survey
+catchability and process variance in their own sections further down. All are
+drawn only when a previous sibling assessment is found.
+
+```{r assess-compare-harvest, results='asis'}
+if (have_prev) {
+  n_yrs_show <- 20   # F-at-age far back is stable; the recent years are where revisions show
+  harv_cmp <- bind_rows(
+    as.data.frame(harvest(prev_env$NSHOM)) %>% mutate(assessment = prev_label),
+    as.data.frame(harvest(NSHOM))          %>% mutate(assessment = cur_label)
+  ) %>%
+    mutate(age  = as.numeric(as.character(age)),
+           year = as.numeric(as.character(year)),
+           assessment = factor(assessment, levels = c(prev_label, cur_label))) %>%
+    filter(year > endYr - n_yrs_show)
+
+  p_harv_cmp <- ggplot(harv_cmp, aes(age, data, colour = assessment)) +
+    geom_line(linewidth = 0.6) +
+    geom_point(size = 0.7) +
+    scale_colour_manual(values = compare_pal) +
+    facet_wrap(~year, ncol = 5) +
+    labs(x = "Age", y = "F", colour = NULL,
+         title = paste0(stockcode, " - harvest pattern (F at age): previous vs. current assessment"),
+         subtitle = paste("Last", n_yrs_show, "years")) +
+    theme_bw(base_size = 11) +
+    theme(legend.position = "top")
+
+  save_and_show(p_harv_cmp, "assessment_comparison_harvest_pattern.png", height = 9)
+}
+```
+
+```{r assess-compare-sr, results='asis'}
+if (have_prev) {
+  sr_one <- function(stk) {
+    ssb_yr <- as.data.frame(ssb(stk))[, c("year", "data")]; names(ssb_yr) <- c("year", "ssb")
+    rec_yr <- as.data.frame(rec(stk))[, c("year", "data")]; names(rec_yr) <- c("year", "rec")
+    rg <- min(as.numeric(dimnames(stk)$age))
+    rec_yr$year <- as.numeric(rec_yr$year) - rg   # shift recruitment back to its spawning year
+    merge(rec_yr, ssb_yr, by = "year")
+  }
+
+  sr_cmp <- bind_rows(
+    sr_one(prev_env$NSHOM) %>% mutate(assessment = prev_label),
+    sr_one(NSHOM)          %>% mutate(assessment = cur_label)
+  ) %>% mutate(assessment = factor(assessment, levels = c(prev_label, cur_label)))
+
+  p_sr_cmp <- ggplot(sr_cmp, aes(ssb, rec, colour = assessment)) +
+    geom_path(aes(group = assessment), alpha = 0.3) +
+    geom_point() +
+    scale_colour_manual(values = compare_pal) +
+    labs(x = "SSB", y = paste0("Recruitment (age ", rage, ")"), colour = NULL,
+         title = paste(stockcode, "- stock-recruitment: previous vs. current assessment")) +
+    theme_bw(base_size = 12) +
+    theme(legend.position = "top")
+
+  save_and_show(p_sr_cmp, "assessment_comparison_stock_recruit.png")
+}
+```
+
+```{r assess-compare-residuals, results='asis'}
+if (have_prev) {
+  resid_cmp <- bind_rows(
+    prev_env$NSHOM.sam@residuals %>% mutate(assessment = prev_label),
+    NSHOM.sam@residuals          %>% mutate(assessment = cur_label)
+  ) %>%
+    filter(!is.na(std.res)) %>%
+    mutate(age = as.numeric(age),
+           direction = ifelse(std.res >= 0, "under-predicted", "over-predicted"),
+           assessment = factor(assessment, levels = c(prev_label, cur_label)))
+
+  p_resid_cmp <- ggplot(resid_cmp, aes(year, age, size = abs(std.res), colour = direction)) +
+    geom_point(alpha = 0.6) +
+    scale_size_area(max_size = 5, name = "|std. residual|") +
+    scale_colour_manual(values = c("under-predicted" = "#1f6feb", "over-predicted" = "#d1242f"), name = NULL) +
+    facet_grid(fleet ~ assessment, scales = "free_y") +
+    labs(x = "Year", y = "Age",
+         title = paste(stockcode, "- SAM standardized log residuals: previous vs. current assessment")) +
+    theme_bw(base_size = 12)
+
+  save_and_show(p_resid_cmp, "assessment_comparison_sam_residuals.png", height = 9)
+}
+```
+
+## Harvest pattern (selectivity at age)
+
+```{r harvest-pattern}
+harvest_df <- as.data.frame(harvest(NSHOM))
+harvest_df$age <- as.numeric(as.character(harvest_df$age))
+harvest_df$year <- as.numeric(as.character(harvest_df$year))
+
+p_harvest <- ggplot(harvest_df, aes(age, data, group = year, colour = year)) +
+  geom_line(linewidth = 0.5) +
+  geom_point(size = 0.8) +
+  scale_colour_viridis_c(name = "Year") +
+  labs(x = "Age", y = "F", title = "Harvest pattern (F at age)")
+
+save_and_show(p_harvest, "harvest_pattern.png")
+```
+
+## Stock-recruitment
+
+```{r stock-recruit}
+ssb_yr <- as.data.frame(ssb(NSHOM))[, c("year", "data")]
+rec_yr <- as.data.frame(rec(NSHOM))[, c("year", "data")]
+names(ssb_yr) <- c("year", "ssb")
+names(rec_yr) <- c("year", "rec")
+
+# recruitment in year y comes from spawning `rage` years earlier
+sr_df <- rec_yr
+sr_df$year <- as.numeric(sr_df$year) - rage
+sr_df <- merge(sr_df, ssb_yr, by = "year")
+
+p_sr <- ggplot(sr_df, aes(ssb, rec, label = year + rage)) +
+  geom_path(colour = "grey70") +
+  geom_point(aes(colour = year + rage)) +
+  scale_colour_viridis_c(name = "Year") +
+  labs(x = "SSB", y = paste0("Recruitment (age ", rage, ")"),
+       title = "Stock-recruitment relationship")
+
+save_and_show(p_sr, "stock_recruit.png")
+```
+
+## Retrospective pattern
+
+```{r retro}
+retro_df <- bind_rows(lapply(names(NSHOM.retro), function(nm) {
+  fit <- NSHOM.retro[[nm]]
+  bind_rows(
+    as_series(tryCatch(ssb(fit),  error = function(e) NULL), "SSB"),
+    as_series(tryCatch(fbar(fit), error = function(e) NULL), "Mean F"),
+    as_series(tryCatch(rec(fit),  error = function(e) NULL), "Recruitment")
+  ) %>% mutate(run = nm)
+}))
+retro_df$series <- factor(retro_df$series, levels = c("SSB", "Mean F", "Recruitment"))
+
+save_and_show(
+  ggplot(retro_df, aes(year, value, colour = run)) +
+    geom_line(linewidth = 0.7) +
+    facet_wrap(~series, scales = "free_y", ncol = 1) +
+    labs(x = "Year", y = NULL, colour = "Assessment\nyear",
+         title = paste(stockcode, "- retrospective pattern")),
+  "retrospective.png", height = 9
+)
+```
+
+## Leave-one-out pattern
+
+```{r loo, results='asis'}
+if (length(NSHOM.loo) > 1) {
+  loo_df <- bind_rows(lapply(names(NSHOM.loo), function(nm) {
+    fit <- NSHOM.loo[[nm]]
+    bind_rows(
+      as_series(tryCatch(ssb(fit),  error = function(e) NULL), "SSB"),
+      as_series(tryCatch(fbar(fit), error = function(e) NULL), "Mean F"),
+      as_series(tryCatch(rec(fit),  error = function(e) NULL), "Recruitment")
+    ) %>% mutate(run = nm)
+  }))
+  loo_df$series <- factor(loo_df$series, levels = c("SSB", "Mean F", "Recruitment"))
+
+  save_and_show(
+    ggplot(loo_df, aes(year, value, colour = run)) +
+      geom_line(linewidth = 0.7) +
+      facet_wrap(~series, scales = "free_y", ncol = 1) +
+      labs(x = "Year", y = NULL, colour = "Fleets used",
+           title = paste(stockcode, "- leave-one-out pattern")),
+    "leave_one_out.png", height = 9
+  )
+}
+```
+
+## Fit to the data
+
+```{r fit-overview}
+# FLSAM's own fit plot: SSB / Fbar / recruitment / catch with the data and 95% CI
+save_and_show(
+  function() print(plot(NSHOM.sam, futureYrs = TRUE)),
+  "model_fit_overview.png", height = 8
+)
+```
+
+```{r fit-to-data-setup}
+# @residuals carries the observation (log.obs) and the model prediction (log.mdl)
+# for every fleet / age / year - the raw material for an observed-vs-fitted plot.
+rez      <- NSHOM.sam@residuals
+have_fit <- all(c("log.obs", "log.mdl") %in% names(rez))
+
+if (have_fit) {
+  fit_wide <- rez %>%
+    filter(!is.na(log.obs), !is.na(log.mdl)) %>%
+    mutate(age_num  = suppressWarnings(as.numeric(as.character(age))),
+           Observed = exp(log.obs),
+           Fitted   = exp(log.mdl))
+
+  # "catch..." fleets are age-structured; everything else (survey / CPUE) is an index
+  catch_fleets <- unique(fit_wide$fleet[grepl("catch", fit_wide$fleet, ignore.case = TRUE)])
+  catch_wide   <- fit_wide %>% filter(fleet %in% catch_fleets)
+  idx_wide     <- fit_wide %>% filter(!fleet %in% catch_fleets)
+
+  fit_pal <- c(Observed = "grey20", Fitted = "#1f6feb")
+}
+```
+
+```{r fit-to-data-catch, results='asis'}
+if (have_fit && nrow(catch_wide) > 0) {
+  catch_facets <- if (length(catch_fleets) > 1) vars(fleet, age_num) else vars(age_num)
+
+  p_fit_catch <- ggplot(catch_wide, aes(x = year)) +
+    geom_point(aes(y = Observed, colour = "Observed"), size = 0.9) +
+    geom_line(aes(y = Fitted, colour = "Fitted"), linewidth = 0.7) +
+    scale_colour_manual(name = NULL, values = fit_pal) +
+    facet_wrap(catch_facets, scales = "free_y") +
+    labs(x = "Year", y = "Catch numbers at age",
+         title = paste(stockcode, "- catch at age: observed vs fitted")) +
+    theme_bw(base_size = 11) +
+    theme(legend.position = "top")
+
+  save_and_show(p_fit_catch, "fit_to_data_catch_at_age.png", height = 8)
+}
+```
+
+```{r fit-to-data-indices, results='asis'}
+if (have_fit && nrow(idx_wide) > 0) {
+  idx_wide <- idx_wide %>%
+    mutate(panel = ifelse(is.na(age_num) | age_num < 0, fleet,
+                          paste0(fleet, " - age ", age_num)))
+
+  p_fit_idx <- ggplot(idx_wide, aes(x = year)) +
+    geom_point(aes(y = Observed, colour = "Observed"), size = 1.1) +
+    geom_line(aes(y = Fitted, colour = "Fitted"), linewidth = 0.7) +
+    scale_colour_manual(name = NULL, values = fit_pal) +
+    facet_wrap(~ panel, scales = "free_y") +
+    labs(x = "Year", y = "Index value",
+         title = paste(stockcode, "- survey / CPUE indices: observed vs fitted")) +
+    theme_bw(base_size = 11) +
+    theme(legend.position = "top")
+
+  save_and_show(p_fit_idx, "fit_to_data_indices.png", height = 6.5)
+}
+```
+
+```{r fit-to-data-fallback, results='asis'}
+if (!have_fit)
+  cat("*Observed-vs-fitted-by-fleet plots need `log.obs` / `log.mdl` in",
+      "`NSHOM.sam@residuals`, which this run does not carry.*\n")
+```
+
+## SAM fit residuals
+
+```{r sam-residuals}
+resid_df <- NSHOM.sam@residuals %>%
+  filter(!is.na(std.res)) %>%
+  mutate(age = as.numeric(age), direction = ifelse(std.res >= 0, "under-predicted", "over-predicted"))
+
+p_resid <- ggplot(resid_df, aes(year, age, size = abs(std.res), colour = direction)) +
+  geom_point(alpha = 0.6) +
+  scale_size_area(max_size = 6, name = "|std. residual|") +
+  scale_colour_manual(values = c("under-predicted" = "#1f6feb", "over-predicted" = "#d1242f"), name = NULL) +
+  facet_wrap(~fleet, scales = "free_y", ncol = 1) +
+  labs(x = "Year", y = "Age", title = paste(stockcode, "- SAM standardized log residuals"))
+
+save_and_show(p_resid, "sam_residuals.png", height = 9)
+```
+
+## Observation variance and survey catchability
+
+```{r obs-var-plot, fig.width=10, fig.height=6}
+obsvar_df <- obs.var(NSHOM.sam)
+
+p_obsvar <- ggplot(obsvar_df, aes(factor(age), value)) +
+  geom_pointrange(aes(ymin = lbnd, ymax = ubnd), colour = "steelblue4", fatten = 2) +
+  facet_wrap(~fleet, scales = "free_x", nrow = 1) +
+  labs(x = "Age", y = "Observation variance",
+       title = "Observation variance by fleet and age")
+
+save_and_show(p_obsvar, "obs_variance.png")
+```
+
+```{r catchability-plot, fig.width=8, fig.height=5}
+q_df <- catchabilities(NSHOM.sam)
+
+p_q <- ggplot(q_df, aes(factor(age), value)) +
+  geom_pointrange(aes(ymin = lbnd, ymax = ubnd), colour = "darkorange3", fatten = 2) +
+  facet_wrap(~fleet, scales = "free_x") +
+  labs(x = "Age", y = "Catchability (q)",
+       title = "Survey catchability at age")
+
+save_and_show(p_q, "catchability.png")
+```
+
+```{r obs-var-log-plot, fig.width=10, fig.height=6}
+# obs.var() above is on the natural (variance) scale. SAM actually estimates
+# logSdLogObs, whose 95% CI is symmetric in log space, so plot that here to show
+# the uncertainty on the scale it was estimated on. Fleet/age-group labels are
+# read from the obs.vars control matrix (same idea as the SAM parameter table).
+desc_groups <- function(mat) {
+  vals <- sort(unique(mat[mat >= 0]))
+  setNames(sapply(vals, function(v) {
+    idx    <- which(mat == v, arr.ind = TRUE)
+    fleets <- unique(rownames(mat)[idx[, 1]])
+    ages   <- suppressWarnings(as.numeric(colnames(mat)[idx[, 2]]))
+    arng   <- if (all(is.na(ages))) NA_character_
+              else if (length(unique(ages)) == 1) paste0("age ", unique(ages))
+              else paste0("ages ", min(ages, na.rm = TRUE), "-", max(ages, na.rm = TRUE))
+    paste0(paste(fleets, collapse = ", "), ifelse(is.na(arng), "", paste0(": ", arng)))
+  }), vals)
+}
+
+obsvar_log_one <- function(sam, ctrl, label) {
+  lab_vec <- tryCatch(desc_groups(ctrl@obs.vars), error = function(e) NULL)
+  sam@params %>%
+    filter(name == "logSdLogObs") %>%
+    mutate(occurrence = row_number(),
+           ages = if (!is.null(lab_vec)) lab_vec[pmin(occurrence, length(lab_vec))]
+                  else as.character(occurrence),
+           lo = value - 1.96 * std.dev,
+           hi = value + 1.96 * std.dev,
+           assessment = label)
+}
+
+cur_lab <- paste("Assessed through", endYr)
+obsvar_log_df <- obsvar_log_one(NSHOM.sam, NSHOM.ctrl, cur_lab)
+if (have_prev) {
+  obsvar_log_df <- bind_rows(
+    obsvar_log_one(prev_env$NSHOM.sam, prev_env$NSHOM.ctrl, prev_label),
+    obsvar_log_df
+  )
+}
+obsvar_log_df$assessment <- factor(obsvar_log_df$assessment,
+                                   levels = unique(obsvar_log_df$assessment))
+
+p_obsvar_log <- ggplot(obsvar_log_df, aes(ages, value, colour = assessment)) +
+  geom_pointrange(aes(ymin = lo, ymax = hi), fatten = 2,
+                  position = position_dodge(width = 0.5)) +
+  labs(x = "Fleet / ages", y = "logSdLogObs  (log scale, value ± 1.96×SE)",
+       colour = NULL,
+       title = "Observation variance by fleet and age (log scale)") +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1),
+        legend.position = if (have_prev) "top" else "none")
+
+if (have_prev) p_obsvar_log <- p_obsvar_log + scale_colour_manual(values = compare_pal)
+
+save_and_show(p_obsvar_log, "obs_variance_log_scale.png")
+```
+
+```{r obs-var-compare-plot, fig.width=10, fig.height=6, results='asis'}
+if (have_prev) {
+  obsvar_cmp <- bind_rows(
+    obs.var(prev_env$NSHOM.sam) %>% mutate(assessment = prev_label),
+    obs.var(NSHOM.sam)          %>% mutate(assessment = cur_label)
+  ) %>% mutate(assessment = factor(assessment, levels = c(prev_label, cur_label)))
+
+  p_obsvar_cmp <- ggplot(obsvar_cmp, aes(factor(age), value, colour = assessment)) +
+    geom_pointrange(aes(ymin = lbnd, ymax = ubnd), fatten = 2,
+                    position = position_dodge(width = 0.5)) +
+    scale_colour_manual(values = compare_pal) +
+    facet_wrap(~fleet, scales = "free_x", nrow = 1) +
+    labs(x = "Age", y = "Observation variance", colour = NULL,
+         title = paste(stockcode, "- observation variance: previous vs. current assessment (natural scale)")) +
+    theme_bw(base_size = 12) +
+    theme(legend.position = "top")
+
+  save_and_show(p_obsvar_cmp, "assessment_comparison_obs_variance.png")
+}
+```
+
+```{r catchability-compare-plot, fig.width=9, fig.height=5, results='asis'}
+if (have_prev) {
+  q_cmp <- bind_rows(
+    catchabilities(prev_env$NSHOM.sam) %>% mutate(assessment = prev_label),
+    catchabilities(NSHOM.sam)          %>% mutate(assessment = cur_label)
+  ) %>% mutate(assessment = factor(assessment, levels = c(prev_label, cur_label)))
+
+  p_q_cmp <- ggplot(q_cmp, aes(factor(age), value, colour = assessment)) +
+    geom_pointrange(aes(ymin = lbnd, ymax = ubnd), fatten = 2,
+                    position = position_dodge(width = 0.5)) +
+    scale_colour_manual(values = compare_pal) +
+    facet_wrap(~fleet, scales = "free_x") +
+    labs(x = "Age", y = "Catchability (q)", colour = NULL,
+         title = paste(stockcode, "- survey catchability at age: previous vs. current assessment")) +
+    theme_bw(base_size = 12) +
+    theme(legend.position = "top")
+
+  save_and_show(p_q_cmp, "assessment_comparison_catchability.png")
+}
+```
+
+## Process (state) variance
+
+```{r process-variance, fig.width=8, fig.height=5}
+proc_df <- NSHOM.sam@params %>%
+  filter(name %in% c("logSdLogFsta", "logSdLogN")) %>%
+  group_by(name) %>%
+  mutate(group = paste0(recode(name, logSdLogFsta = "F", logSdLogN = "N (recruitment/state)"),
+                         " - group ", row_number())) %>%
+  ungroup() %>%
+  mutate(sd = exp(value), lo = exp(value - 1.96 * std.dev), hi = exp(value + 1.96 * std.dev))
+
+p_proc <- ggplot(proc_df, aes(group, sd)) +
+  geom_pointrange(aes(ymin = lo, ymax = hi), colour = "seagreen4", fatten = 2) +
+  labs(x = NULL, y = "Process error SD",
+       title = "Process (state) variance: F and N random walks") +
+  theme(axis.text.x = element_text(angle = 20, hjust = 1))
+
+save_and_show(p_proc, "process_variance.png")
+```
+
+```{r process-variance-compare, fig.width=9, fig.height=5, results='asis'}
+if (have_prev) {
+  proc_cmp <- bind_rows(
+    prev_env$NSHOM.sam@params %>% mutate(assessment = prev_label),
+    NSHOM.sam@params          %>% mutate(assessment = cur_label)
+  ) %>%
+    filter(name %in% c("logSdLogFsta", "logSdLogN")) %>%
+    group_by(assessment, name) %>%
+    mutate(group = paste0(recode(name, logSdLogFsta = "F", logSdLogN = "N (recruitment/state)"),
+                          " - group ", row_number())) %>%
+    ungroup() %>%
+    mutate(sd = exp(value),
+           lo = exp(value - 1.96 * std.dev),
+           hi = exp(value + 1.96 * std.dev),
+           assessment = factor(assessment, levels = c(prev_label, cur_label)))
+
+  p_proc_cmp <- ggplot(proc_cmp, aes(group, sd, colour = assessment)) +
+    geom_pointrange(aes(ymin = lo, ymax = hi), fatten = 2,
+                    position = position_dodge(width = 0.5)) +
+    scale_colour_manual(values = compare_pal) +
+    labs(x = NULL, y = "Process error SD", colour = NULL,
+         title = paste(stockcode, "- process (state) variance: previous vs. current assessment")) +
+    theme_bw(base_size = 12) +
+    theme(axis.text.x = element_text(angle = 20, hjust = 1), legend.position = "top")
+
+  save_and_show(p_proc_cmp, "assessment_comparison_process_variance.png")
+}
+```
+
+## SAM parameter table
+
+```{r sam-partable}
+state_like <- c("logF", "logN", "logCatch", "logCatchByFleet", "logfbar", "logLagR", "logLand",
+                "logR", "logssb", "logtsb", "beforeLastLogF", "beforeLastLogN",
+                "lastLogF", "lastLogN", "missing")
+
+# Plain-English meaning of each SAM hyperparameter name. These names come from the SAM/TMB
+# model structure itself (stable across assessment years), not from this year's data, so this
+# lookup doesn't need updating unless NSHOM.ctrl's parameterisation changes.
+param_meaning <- c(
+  logFpar               = "log survey catchability (q) - see 'Observation variance and survey catchability' above",
+  logSdLogFsta           = "log SD of the F-at-age random walk - see 'Process (state) variance' above",
+  logSdLogN               = "log SD of the N-at-age (recruitment/survival) random walk - see 'Process (state) variance' above",
+  logSdLogObs             = "log SD of observation error - see 'Observation variance and survey catchability' above",
+  itrans_rho              = "transformed AR(1) correlation of F-at-age across ages (internal parameterisation)",
+  logFScaleMSY            = "log scaling factor linking model F to an external reference-point calculation",
+  implicitFunctionDelta   = "internal TMB numerical parameter (Laplace approximation) - not biologically meaningful",
+  splinePenalty           = "smoothing penalty for a spline-parameterised term in the model - not biologically meaningful"
+)
+
+# which fleet(s)/age(s) each numbered instance of a parameter actually belongs to -
+# read directly from NSHOM.ctrl's own group matrices, so this describes whatever
+# grouping is actually in use rather than needing manual updates if it ever changes
+describe_groups <- function(mat) {
+  vals <- sort(unique(mat[mat >= 0]))
+  setNames(sapply(vals, function(v) {
+    idx <- which(mat == v, arr.ind = TRUE)
+    fleets <- unique(rownames(mat)[idx[, 1]])
+    ages <- suppressWarnings(as.numeric(colnames(mat)[idx[, 2]]))
+    arng <- if (all(is.na(ages))) NA_character_
+            else if (length(unique(ages)) == 1) paste0("age ", unique(ages))
+            else paste0("ages ", min(ages, na.rm = TRUE), "-", max(ages, na.rm = TRUE))
+    paste0(paste(fleets, collapse = ", "), ifelse(is.na(arng), "", paste0(": ", arng)))
+  }), vals)
+}
+
+group_labels <- list(
+  logFpar      = tryCatch(describe_groups(NSHOM.ctrl@catchabilities), error = function(e) NULL),
+  logSdLogFsta = tryCatch(describe_groups(NSHOM.ctrl@f.vars),         error = function(e) NULL),
+  logSdLogN    = tryCatch(describe_groups(NSHOM.ctrl@logN.vars),      error = function(e) NULL),
+  logSdLogObs  = tryCatch(describe_groups(NSHOM.ctrl@obs.vars),       error = function(e) NULL)
+)
+
+par_tab <- NSHOM.sam@params %>%
+  filter(!name %in% state_like) %>%
+  group_by(name) %>%
+  mutate(occurrence = row_number()) %>%
+  ungroup() %>%
+  mutate(
+    ages = mapply(function(nm, i) {
+      g <- group_labels[[nm]]
+      if (!is.null(g) && i <= length(g)) g[i] else NA_character_
+    }, name, occurrence),
+    meaning = ifelse(name %in% names(param_meaning), param_meaning[name], "(no description available)"),
+    flag = case_when(
+      is.na(std.dev) | !is.finite(std.dev) ~ "check: non-finite SE",
+      std.dev > 2                          ~ "check: large SE",
+      TRUE                                 ~ "ok"
+    )
+  ) %>%
+  select(name, ages, meaning, value, std.dev, flag)
+
+n_flagged <- sum(par_tab$flag != "ok")
+
+kable(par_tab, digits = 4,
+      col.names = c("Parameter", "Fleet/ages", "Meaning", "Estimate (log scale)", "Std. error", "Flag"),
+      caption = paste0("SAM parameter table (", stockcode, ", ", currentYear, " assessment) - ",
+                        n_flagged, " of ", nrow(par_tab), " parameter(s) flagged"))
+```
+
+# Projections
+
+```{r projection-options, results='asis'}
+fc_summary_file <- "forecast/options - summary.csv"
+fc_multi_file   <- "forecast/multi-options - summary.csv"
+
+if (file.exists(fc_summary_file)) {
+  opts <- read.csv(fc_summary_file, check.names = FALSE)
+  kable(opts, caption = paste0("Short-term forecast catch options (ImY=", ImY,
+                                ", AdY=", AdY, ", CtY=", CtY, ")"), digits = 3)
+}
+```
+
+```{r projection-sweep-plot, results='asis'}
+if (file.exists(fc_multi_file) && file.exists(fc_summary_file)) {
+  multi <- read.csv(fc_multi_file, check.names = FALSE)
+
+  fbar_col  <- sprintf("Fbar (%d)", AdY)
+  catch_col <- sprintf("Catch (%d)", AdY)
+  ssb_col   <- sprintf("SSB (%d)", CtY)
+
+  named_opts <- opts %>%
+    select(Rationale, fbar = all_of(fbar_col), catch = all_of(catch_col), ssb = all_of(ssb_col))
+
+  p_yield <- ggplot(multi, aes(.data[[fbar_col]], .data[[catch_col]])) +
+    geom_line(colour = "grey50") +
+    geom_point(data = named_opts, aes(fbar, catch, colour = Rationale), size = 2.5) +
+    labs(x = paste("Fbar", AdY), y = paste("Catch", AdY, "(t)"), colour = NULL,
+         title = "Yield vs F") +
+    theme(legend.position = "none")
+
+  p_ssb <- ggplot(multi, aes(.data[[fbar_col]], .data[[ssb_col]])) +
+    geom_line(colour = "grey50") +
+    geom_point(data = named_opts, aes(fbar, ssb, colour = Rationale), size = 2.5) +
+    labs(x = paste("Fbar", AdY), y = paste("SSB", CtY, "(t)"), colour = NULL,
+         title = "SSB vs F")
+
+  save_and_show(p_yield + p_ssb, "projection_tradeoff.png", width = 12)
+}
+```
+
+```{r projection-hcr, results='asis'}
+hcr_file <- "forecast/options - summary applying Btrigger.csv"
+if (file.exists(hcr_file)) {
+  kable(read.csv(hcr_file), caption = "ICES MSY advice-rule (Btrigger) consistent option", digits = 3)
+}
+```
+

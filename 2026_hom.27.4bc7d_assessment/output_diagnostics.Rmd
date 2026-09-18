@@ -1,0 +1,279 @@
+---
+title: "hom.27.4bc7d - SAM diagnostics: `r params$run`"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+params:
+  model_file: "model/model_benchmark.RData"
+  run: "run_benchmark"
+  refyy: 2025
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    df_print: kable
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE,
+                       fig.width = 9, fig.height = 7)
+
+library(FLSAM)
+library(FLCore)
+library(ggplot2)
+library(lattice)
+library(knitr)
+
+theme_set(theme_bw())
+```
+
+```{r load}
+load(params$model_file, verbose = FALSE) # NSHOM, NSHOM.tun, NSHOM.sam, NSHOM.ctrl, NSHOM.retro, NSHOM.loo
+
+sam   <- NSHOM.sam
+tun   <- NSHOM.tun
+retro <- NSHOM.retro
+loo   <- NSHOM.loo[-2]
+refyy <- params$refyy
+```
+
+# Model fit
+
+```{r sam-fit}
+print(plot(sam, futureYrs = TRUE))
+```
+
+# Residuals
+
+```{r residual-diagnostics}
+residual.diagnostics(sam)
+```
+
+```{r residuals-by-fleet}
+resids <- subset(residuals(sam))
+resids$std.res[which(is.na(resids$std.res))] <- 0
+
+print(xyplot(age ~ year | fleet, data = resids, main = "Residuals by fleet",
+              group = resids$fleet, cex = resids$std.res,
+              panel = function(...) {
+                lst <- list(...)
+                panel.xyplot(lst$x, lst$y,
+                             pch = ifelse(lst$cex[lst$subscript] > 0, 1, 19),
+                             col = "black", cex = 1 * abs(lst$cex[lst$subscript]))
+              }))
+```
+
+# Survey catchability
+
+```{r catchability, results='asis'}
+catch <- catchabilities(sam)
+if (any(table(catch$fleet) > 1)) {
+  print(xyplot(value + ubnd + lbnd ~ age | fleet, catch,
+               scale = list(alternating = FALSE, y = list(relation = "free")), as.table = TRUE,
+               type = "l", lwd = c(2, 1, 1), col = c("black", "grey", "grey"),
+               subset = fleet %in% names(tun),
+               main = "Survey catchability parameters", ylab = "Catchability", xlab = "Age"))
+}
+```
+
+# F random walk variance
+
+```{r fvar}
+fvar <- f.var(sam)
+print(xyplot(value + ubnd + lbnd ~ age | fleet, data = fvar,
+             scale = list(alternating = FALSE, y = list(relation = "free")), as.table = TRUE,
+             type = "l", lwd = c(2, 1, 1), col = c("black", "grey", "grey"),
+             main = "F random walk parameters", ylab = "Variance", xlab = "Age"))
+```
+
+# Observation variance
+
+```{r obsvar-barplot}
+obv <- obs.var(sam)
+obv$str <- paste(obv$fleet, ifelse(is.na(obv$age), "", obv$age))
+obv <- obv[order(obv$value), ]
+
+bp <- barplot(obv$value, ylab = "Observation Variance",
+              main = "Observation variances by data source", col = factor(obv$fleet))
+axis(1, at = bp, labels = obv$str, las = 3, lty = 0, mgp = c(0, 0, 0))
+legend("topleft", levels(obv$fleet), pch = 15, col = seq_len(nlevels(obv$fleet)), pt.cex = 1.5)
+```
+
+```{r obsvar-vs-cv}
+plot(obv$value, obv$CV, xlab = "Observation variance", ylab = "CV of estimate", log = "x",
+     pch = 16, col = obv$fleet, main = "Observation variance vs uncertainty")
+text(obv$value, obv$CV, obv$str, pos = 4, cex = 0.75, xpd = NA)
+```
+
+# Selectivity of the fishery by pentad
+
+```{r selectivity-pentad}
+sel.pat <- merge(f(sam), fbar(sam), by = "year", suffixes = c(".f", ".fbar"))
+sel.pat$sel <- sel.pat$value.f / sel.pat$value.fbar
+sel.pat$age <- as.numeric(as.character(sel.pat$age))
+
+# labels each pentad panel's lines with their starting year, at the oldest age
+custom_panel <- function(x, y, groups, subscripts, ...) {
+  unique_groups <- unique(groups[subscripts])
+  for (grp in unique_groups) {
+    indices <- subscripts[groups[subscripts] == grp] - min(subscripts) + 1
+    panel.lines(x[indices], y[indices], ...)
+
+    aggregated_data <- aggregate(y[indices],
+                                  by = list(groups[indices + min(subscripts) - 1]),
+                                  FUN = function(v) v[length(v)])
+
+    for (i in seq_len(nrow(aggregated_data))) {
+      group <- aggregated_data$Group.1[i]
+      x_end <- 14
+      y_end <- aggregated_data$x[i]
+      yr <- strsplit(as.character(group), " ")[[1]][1]
+      panel.text(x_end + 0.2, y_end + 0.05, labels = yr, cex = 0.7)
+    }
+  }
+}
+
+print(
+  xyplot(sel ~ age | sprintf("%i's", floor(year / 5) * 5), data = sel.pat,
+         groups = paste(year, fleet), type = "l", as.table = TRUE,
+         scale = list(alternating = FALSE),
+         main = "Selectivity of the Fishery by Pentad", xlab = "Age", ylab = "F/Fbar",
+         panel = custom_panel)
+)
+
+print(
+  xyplot(sel ~ age | sprintf("%i's", floor(year / 5) * 5), data = sel.pat,
+         groups = paste(year, fleet), type = "l", as.table = TRUE,
+         scale = list(alternating = FALSE),
+         main = "Selectivity of the Fishery by Pentad", xlab = "Age", ylab = "F/Fbar")
+)
+```
+
+# Parameter correlation
+
+```{r retroparams-corplot}
+print(retroParams(setNames(list(sam), as.character(refyy))))
+print(cor.plot(sam))
+```
+
+# Uncertainty of key parameters over time
+
+```{r cv-time}
+CV.yrs <- ssb(sam)$year
+CV.dat <- cbind(SSB = ssb(sam)$CV, Fbar = fbar(sam)$CV, Rec = rec(sam)$CV)
+matplot(CV.yrs, CV.dat, type = "l", ylim = range(pretty(c(0, CV.dat))), yaxs = "i",
+        xlab = "Year", ylab = "CV of estimate", main = "Uncertainties of key parameters")
+legend("topleft", legend = colnames(CV.dat), lty = 1:5, col = 1:6, bty = "n")
+```
+
+# Retrospective pattern
+
+```{r retro-plot, results='asis'}
+if (!is.null(retro)) {
+  print(plot(retro))
+}
+```
+
+```{r mohns-rho}
+ssb_mean  <- mean(mohns.rho(retro, ref.year = refyy, span = 3, type = "ssb")[1:3, 1])
+fbar_mean <- mean(mohns.rho(retro, ref.year = refyy, span = 3, type = "fbar")[1:3, 1])
+rec_mean  <- mean(mohns.rho(retro, ref.year = refyy, span = 3, type = "rec")[1:3, 1])
+
+results_table <- data.frame(
+  Metric   = c("SSB", "Fbar", "Recruitment"),
+  Mean_Rho = c(ssb_mean, fbar_mean, rec_mean)
+)
+kable(results_table, digits = 4, caption = "Mohn's rho")
+```
+
+```{r retro-params-print, results='asis'}
+if (!is.null(retro)) retroParams(retro)
+```
+
+# Leave-one-out pattern
+
+```{r loo, results='asis'}
+if (!is.null(loo) && length(loo) > 0) {
+  print(plot(loo, main = "Leave one out"))
+}
+```
+
+# Parameter bindings
+
+```{r retro-params-bind, results='asis'}
+retroParams_bind_ggplt <- function(x) {
+  retroPars <- lapply(x, params)
+  subretroPars <- lapply(retroPars, function(y) {
+    subset(y, name %in% c("logFpar", "lowQpow", "logSdLogFsta",
+                           "logSdLogN", "logSdLogObs", "rec_loga", "rec_logb",
+                           "rho", "logScale", "logScaleSSB", "logPowSSB", "logSdSSB"))
+  })
+
+  subretroPars <- lapply(as.list(seq_along(subretroPars)), function(y) {
+    cbind(year = names(subretroPars)[y], subretroPars[[y]])
+  })
+
+  subretroPars <- lapply(subretroPars, function(y) {
+    lapply(as.list(names(table(ac(y$name)))), function(z) {
+      tmpy <- subset(y, name == z)
+      tmpy$nameOrig <- tmpy$name
+      if (nrow(tmpy) > 1) tmpy$name_bound <- paste(tmpy$name, seq_len(nrow(tmpy)))
+      tmpy
+    })
+  })
+
+  subretroPars <- do.call(rbind, lapply(subretroPars, function(y) do.call(rbind, y)))
+
+  if (length(lapply(x, params)) == 1) {
+    subretroPars$bindings <- as.numeric(gsub("[^0-9]", "", subretroPars$name_bound))
+
+    subretroPars_exp <- subretroPars
+    subretroPars_exp$lo_log  <- subretroPars_exp$value - 1.96 * subretroPars_exp$std.dev
+    subretroPars_exp$hi_log  <- subretroPars_exp$value + 1.96 * subretroPars_exp$std.dev
+    subretroPars_exp$val_exp <- exp(subretroPars_exp$value)
+    subretroPars_exp$hi_exp  <- exp(subretroPars_exp$hi_log)
+    subretroPars_exp$lo_exp  <- exp(subretroPars_exp$lo_log)
+
+    print(kable(subretroPars_exp[, c("year", "name", "bindings", "val_exp", "std.dev", "hi_exp", "lo_exp")],
+                digits = 4, caption = "Bound parameters (back-transformed)"))
+
+    p <- ggplot(subretroPars_exp, aes(x = factor(bindings), y = val_exp)) +
+      geom_bar(stat = "identity", fill = "steelblue", width = 0.7) +
+      geom_errorbar(aes(ymin = lo_exp, ymax = hi_exp), width = 0.2, color = "black") +
+      facet_wrap(~ name, scales = "free_y") +
+      labs(x = "Bindings", y = "Value") +
+      theme_minimal()
+    print(p)
+  }
+}
+
+retroParams_bind_ggplt(setNames(list(sam), as.character(refyy)))
+```
+
+# Retrospective residuals by fleet
+
+```{r retro-residuals}
+retroResiduals_ggplt <- function(x, fleet, yrs) {
+  res <- lapply(x, residuals)
+  res <- lapply(res, function(y) y[which(y$fleet == fleet & y$year %in% yrs), ])
+  res <- lapply(res, function(y) cbind(y, retro = max(y$year)))
+  res <- do.call(rbind, res)
+
+  p <- ggplot(data = res, aes(x = year, y = std.res, group = retro, col = as.factor(retro))) +
+    geom_line() +
+    geom_point(shape = 1, size = 3) +
+    xlab("Year") +
+    theme_bw()
+
+  if (!-1 %in% unique(res$age)) p <- p + facet_wrap(~age)
+  print(p)
+}
+
+# only the fleets actually present in this run's residuals are plotted, so this
+# works unmodified across model runs with different fleet sets
+fleets_avail <- unique(residuals(sam)$fleet)
+fleets_check <- intersect(c("catch unique", "IBTS Q3_Q4", "PFA standardized CPUE"), fleets_avail)
+
+for (fl in fleets_check) {
+  retroResiduals_ggplt(retro, fleet = fl, yrs = (refyy - 4):refyy)
+}
+```

@@ -1,0 +1,366 @@
+---
+title: "North Sea Horse Mackerel (hom.27.4bc7d) - Length and Age Compositions"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    df_print: kable
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+
+library(icesTAF)
+library(FLCore)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(knitr)
+
+theme_set(theme_bw())
+
+stockcode <- "hom.27.4bc7d"
+
+FIG_DIR <- "report/figures_compositions"
+mkdir("report")
+mkdir(FIG_DIR)
+
+save_and_show <- function(p, filename, width = 10, height = 6.5, dpi = 300) {
+  path <- file.path(FIG_DIR, filename)
+  if (inherits(p, "ggplot")) {
+    ggsave(path, plot = p, width = width, height = height, dpi = dpi, bg = "white")
+  } else {
+    png(path, width = width, height = height, units = "in", res = dpi, bg = "white")
+    on.exit(dev.off())
+    p()
+  }
+  knitr::include_graphics(path)
+}
+```
+
+```{r load}
+load("model/model_benchmark.RData", verbose = FALSE) # NSHOM
+load("data/input.RData", verbose = FALSE)        # CAA, WAA
+
+ages    <- as.numeric(colnames(CAA))
+minAge  <- min(ages)
+maxAge  <- max(ages)
+years_all <- as.numeric(rownames(CAA))
+startYr <- min(years_all)
+endYr   <- max(years_all)          # last year with catch data
+currentYear <- endYr               # the "current" year this report describes
+```
+
+# `r NSHOM@name` (`r stockcode`)
+
+# Catch at age (numbers)
+
+```{r caa-table}
+CAA_tab <- as.data.frame(t(CAA))
+CAA_tab$age <- rownames(CAA_tab)
+CAA_tab <- CAA_tab[, c("age", setdiff(names(CAA_tab), "age"))]
+write.csv(CAA_tab, "report/CAA_tab.csv", row.names = FALSE)
+kable(CAA_tab, caption = "Catch at age (thousands), all years", digits = 1, row.names = FALSE)
+```
+
+```{r caa-bubble}
+CAA_long <- as.data.frame(CAA) %>%
+  mutate(year = as.numeric(rownames(CAA))) %>%
+  pivot_longer(-year, names_to = "age", values_to = "catch") %>%
+  mutate(age = as.numeric(age))
+
+p_caa <- ggplot(CAA_long, aes(year, age, size = catch)) +
+  geom_point(shape = 21, alpha = 0.5, na.rm = TRUE) +
+  scale_size_area(max_size = 10, name = "Catch (thousands)") +
+  scale_x_continuous(breaks = scales::breaks_pretty()) +
+  labs(x = "Year", y = "Age", title = paste(stockcode, "- catch at age (numbers)"))
+
+save_and_show(p_caa, "catch_N_at_age.png")
+```
+
+## Internal consistency
+
+```{r caa-internal-consistency}
+save_and_show(
+  function() {
+    library(latticeExtra)
+    print(plot(FLIndex(index = NSHOM@catch.n), type = "internal"))
+  },
+  "catch_at_age_internal_consistency.png"
+)
+```
+
+# Weight at age
+
+```{r waa-table}
+WAA_tab <- as.data.frame(t(WAA))
+WAA_tab$age <- rownames(WAA_tab)
+WAA_tab <- WAA_tab[, c("age", setdiff(names(WAA_tab), "age"))]
+write.csv(WAA_tab, "report/WAA_tab.csv", row.names = FALSE)
+kable(WAA_tab, caption = "Mean weight at age (kg), all years", digits = 3, row.names = FALSE)
+```
+
+```{r waa-plot}
+WAA_long <- as.data.frame(WAA) %>%
+  mutate(year = as.numeric(rownames(WAA))) %>%
+  pivot_longer(-year, names_to = "age", values_to = "weight") %>%
+  mutate(age = factor(as.numeric(age)))
+
+p_waa <- ggplot(WAA_long, aes(year, weight, colour = age)) +
+  geom_line() + geom_point(size = 0.8) +
+  labs(x = "Year", y = "Weight (kg)", colour = "Age",
+       title = "Mean weight at age (catch)")
+
+save_and_show(p_waa, "mean_weight_at_age.png")
+```
+
+# Length at age (`r currentYear`)
+
+```{r lena-parse}
+# Generic parser for the repeated "<title> by Area" blocks in the InterCatch
+# CatchAndSampleDataTables.txt export. Table length is detected from the file
+# itself (first blank/non-tabular line) rather than assumed from a fixed age
+# range, and the "All periods" (or a given quarter) sub-table is located by
+# matching its preceding "For Period" line rather than a hardcoded position.
+extract_area_table <- function(lines, title, period = "All periods", fallback_occurrence = 5) {
+  starts <- grep(title, lines, fixed = TRUE)
+  if (length(starts) == 0) return(NULL)
+  sel <- starts[vapply(starts, function(i) {
+    ctx <- lines[max(1, i - 6):max(1, i - 1)]
+    any(grepl(paste0("For Period\\t", period), ctx))
+  }, logical(1))]
+  start <- if (length(sel) > 0) sel[1] else starts[min(fallback_occurrence, length(starts))]
+
+  header <- strsplit(lines[start + 3], "\t")[[1]]
+  body <- character(0)
+  j <- start + 4
+  while (j <= length(lines) && grepl("\t", lines[j]) && nchar(trimws(lines[j])) > 0) {
+    body <- c(body, lines[j])
+    j <- j + 1
+  }
+  if (length(body) == 0) return(NULL)
+
+  rows <- strsplit(body, "\t")
+  age  <- vapply(rows, `[`, character(1), 1)
+  vals <- lapply(rows, function(r) as.numeric(gsub(",", "", r[-1])))
+  df <- as.data.frame(do.call(rbind, vals))
+  names(df) <- header[-1]
+  df$age <- as.numeric(age)
+  df
+}
+
+catch_file <- list.files(taf.data.path(), pattern = "CatchAndSampleDataTables", full.names = TRUE)[1]
+catch_lines <- scan(catch_file, what = character(), sep = "\n", quiet = TRUE)
+
+pad_ages <- function(df) {
+  full <- data.frame(age = minAge:maxAge)
+  out  <- left_join(full, df, by = "age")
+  out[is.na(out)] <- 0
+  out$year <- currentYear
+  out
+}
+
+lena_area  <- pad_ages(extract_area_table(catch_lines, "Mean Length at Age by Area"))
+canum_area <- pad_ages(extract_area_table(catch_lines, "Catch Numbers at Age by Area"))
+weca_area  <- pad_ages(extract_area_table(catch_lines, "Mean Weight at Age by Area"))
+
+write.csv(lena_area,  "report/lena_area.csv",  row.names = FALSE)
+write.csv(canum_area, "report/canum_area.csv", row.names = FALSE)
+write.csv(weca_area,  "report/weca_area.csv",  row.names = FALSE)
+
+area_cols <- setdiff(names(lena_area), c("age", "year", "Total"))
+```
+
+```{r lena-table}
+kable(lena_area[, c("age", area_cols, "Total")], caption = paste("Mean length at age (cm) by area,", currentYear), digits = 1, row.names = FALSE)
+```
+
+```{r lena-plot}
+lena_long <- lena_area %>%
+  pivot_longer(all_of(area_cols), names_to = "area", values_to = "length") %>%
+  filter(length > 0)
+
+p_lena <- ggplot(lena_long, aes(age, length, colour = area)) +
+  geom_line() + geom_point() +
+  labs(x = "Age", y = "Mean length (cm)", colour = "Area",
+       title = paste0("Mean length at age (", currentYear, ")"))
+
+save_and_show(p_lena, "mean_length_at_age.png")
+```
+
+## Catch numbers at age by area (`r currentYear`)
+
+```{r canum-table}
+kable(canum_area[, c("age", area_cols)], caption = paste("Catch numbers at age (thousands) by area,", currentYear), digits = 1, row.names = FALSE)
+```
+
+```{r canum-plot}
+canum_long <- canum_area %>%
+  pivot_longer(all_of(area_cols), names_to = "area", values_to = "catch") %>%
+  filter(catch > 0)
+
+p_canum <- ggplot(canum_long, aes(age, catch, fill = area)) +
+  geom_col(position = "stack") +
+  labs(x = "Age", y = "Catch numbers (thousands)", fill = "Area",
+       title = paste0("Catch numbers at age by area (", currentYear, ")"))
+
+save_and_show(p_canum, "canum_area.png")
+```
+
+# Length frequency distribution of the catch {.tabset}
+
+```{r lenfreq-load}
+# Picks up every "NSHOM_lengthData_<year>.csv" file present in data/ (one raw
+# InterCatch length-frequency export per year) - add a new year's file and it
+# shows up here automatically, nothing to edit.
+lenfreq_files <- list.files("data", pattern = "^NSHOM_lengthData_[0-9]{4}\\.csv$", full.names = TRUE)
+
+lenfreq_df <- bind_rows(lapply(lenfreq_files, read.csv))
+lenfreq_df$Year <- factor(lenfreq_df$Year)
+lenfreq_df$category <- recode(lenfreq_df$CatchCategory,
+                               L = "Landings", D = "Discards",
+                               C = "Catch (combined)", BMS = "BMS landing")
+
+# reusable builders, parameterised by a pre-filtered (by origin) data frame and
+# a filename suffix - each origin tab below just calls these once, rather than
+# repeating the plotting code per origin
+plot_lenfreq_by_year <- function(df, suffix) {
+  d <- df %>% group_by(Year, Length_cm) %>%
+    summarise(NumberCaught = sum(NumberCaught, na.rm = TRUE), .groups = "drop")
+  p <- ggplot(d, aes(Length_cm, NumberCaught)) +
+    geom_col(fill = "steelblue4") +
+    facet_wrap(~Year, ncol = 1, scales = "free_y") +
+    labs(x = "Length (cm)", y = "Number caught (raised)",
+         title = paste(stockcode, "- length frequency by year"))
+  save_and_show(p, paste0("length_frequency_by_year_", suffix, ".png"),
+                height = 2.5 * length(unique(d$Year)))
+}
+
+plot_lenfreq_by_category <- function(df, suffix) {
+  d <- df %>% group_by(Year, category, Length_cm) %>%
+    summarise(NumberCaught = sum(NumberCaught, na.rm = TRUE), .groups = "drop")
+  p <- ggplot(d, aes(Length_cm, NumberCaught, fill = Year)) +
+    geom_col(position = "dodge") +
+    facet_wrap(~category, scales = "free_y") +
+    labs(x = "Length (cm)", y = "Number caught (raised)", fill = NULL,
+         title = "Length frequency by catch category")
+  save_and_show(p, paste0("length_frequency_by_category_", suffix, ".png"))
+}
+
+plot_lenfreq_by_fleet <- function(df, suffix) {
+  d <- df %>% group_by(Year, Fleet, Length_cm) %>%
+    summarise(NumberCaught = sum(NumberCaught, na.rm = TRUE), .groups = "drop")
+  n_fleet <- length(unique(d$Fleet))
+  p <- ggplot(d, aes(Length_cm, NumberCaught, fill = Year)) +
+    geom_col(position = "dodge") +
+    facet_wrap(~Fleet, scales = "free_y") +
+    labs(x = "Length (cm)", y = "Number caught (raised)", fill = NULL,
+         title = "Length frequency by fleet") +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+  save_and_show(p, paste0("length_frequency_by_fleet_", suffix, ".png"),
+                width = min(14, 4 * n_fleet), height = 3 + 2 * (n_fleet %/% 4))
+}
+
+table_lenfreq_summary <- function(df) {
+  s <- df %>% group_by(Year) %>%
+    summarise(
+      `Mean length (cm)`  = round(weighted.mean(Length_cm, NumberCaught, na.rm = TRUE), 1),
+      `Length range (cm)` = paste(min(Length_cm), "-", max(Length_cm)),
+      `N length measurements` = sum(NumLngtMeas, na.rm = TRUE),
+      .groups = "drop"
+    )
+  kable(s, caption = "Length sampling summary by year", row.names = FALSE)
+}
+```
+
+## IC_SD_table
+
+```{r lenfreq-ic-year}
+lenfreq_ic <- filter(lenfreq_df, origin == "IC_SD_table")
+plot_lenfreq_by_year(lenfreq_ic, "ic")
+```
+
+### By catch category
+
+```{r lenfreq-ic-category}
+plot_lenfreq_by_category(lenfreq_ic, "ic")
+```
+
+### By fleet
+
+```{r lenfreq-ic-fleet}
+plot_lenfreq_by_fleet(lenfreq_ic, "ic")
+```
+
+### Sampling summary
+
+```{r lenfreq-ic-summary}
+table_lenfreq_summary(lenfreq_ic)
+```
+
+## YellowSheet
+
+```{r lenfreq-ys-year}
+lenfreq_ys <- filter(lenfreq_df, origin == "YellowSheet")
+plot_lenfreq_by_year(lenfreq_ys, "ys")
+```
+
+### By catch category
+
+```{r lenfreq-ys-category}
+plot_lenfreq_by_category(lenfreq_ys, "ys")
+```
+
+### By fleet
+
+```{r lenfreq-ys-fleet}
+plot_lenfreq_by_fleet(lenfreq_ys, "ys")
+```
+
+### Sampling summary
+
+```{r lenfreq-ys-summary}
+table_lenfreq_summary(lenfreq_ys)
+```
+
+# Catch curves and total mortality by cohort
+
+```{r catch-curves-setup}
+# a cohort needs several years of observed ages to fit a reliable slope;
+# 8 years mirrors the cutoff used in past editions of this report, kept here
+# as a relative offset so it scales forward
+minCohortSpan   <- 8
+startYearCohort <- startYr
+endYearCohort   <- endYr - minCohortSpan
+stkCohort <- FLCohort(log(NSHOM@catch.n))
+```
+
+```{r catch-curves-plot}
+save_and_show(
+  function() print(FLCore::plot(stkCohort[, as.character(startYearCohort:endYearCohort)])),
+  "catch_curves_by_cohort.png"
+)
+```
+
+```{r catch-curves-slope}
+coh  <- startYearCohort:endYearCohort
+data_coh <- as.data.frame(stkCohort)
+
+slope_df <- bind_rows(lapply(coh, function(cy) {
+  datsel <- data_coh[data_coh$cohort == cy & !is.na(data_coh$data) & data_coh$data > 0, ]
+  if (nrow(datsel) < 2) return(NULL)
+  fit <- lm(log(data) ~ age, data = datsel)
+  data.frame(cohort = cy, Z = -coef(fit)[["age"]])
+}))
+
+p_slope <- ggplot(slope_df, aes(cohort, Z)) +
+  geom_line() + geom_point() +
+  expand_limits(y = 0) +
+  labs(x = "Cohort", y = "Total mortality Z",
+       title = "Total mortality by cohort (catch curve slope)")
+
+save_and_show(p_slope, "catch_curves_by_cohort_slope.png")
+write.csv(drop(stkCohort), "report/catch_at_age_cohort.csv", row.names = FALSE)
+```

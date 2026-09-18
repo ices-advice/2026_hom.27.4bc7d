@@ -1,0 +1,600 @@
+---
+title: "hom.27.4bc7d - Model comparison: benchmark vs. obsvarpool vs. final"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    df_print: kable
+    md_extensions: -smart
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+
+library(FLSAM)
+library(FLCore)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(knitr)
+library(DT)
+
+dt <- function(df, caption = NULL, digits = NULL, pagelength = 20) {
+  DT::datatable(df, caption = caption, rownames = FALSE,
+                options = list(pageLength = pagelength, dom = "t", ordering = FALSE),
+                class = "stripe hover") -> tbl
+  if (!is.null(digits)) tbl <- DT::formatRound(tbl, columns = digits, digits = 4)
+  tbl
+}
+
+theme_set(theme_bw())
+
+# every figure below is also written to report/figures/model_comparison/ as a PNG
+# at print resolution (same helper as report.Rmd's save_and_show), then embedded
+FIG_DIR <- "report/figures/model_comparison"
+dir.create(FIG_DIR, recursive = TRUE, showWarnings = FALSE)
+
+save_and_show <- function(p, filename, width = 10, height = 6.5, dpi = 300) {
+  path <- file.path(FIG_DIR, filename)
+  if (inherits(p, "ggplot")) {
+    ggsave(path, plot = p, width = width, height = height, dpi = dpi, bg = "white")
+  } else {
+    png(path, width = width, height = height, units = "in", res = dpi, bg = "white")
+    on.exit(dev.off())
+    p()
+  }
+  knitr::include_graphics(path)
+}
+
+# sequential figure numbering, assigned in the order figures actually appear
+.fig_n <- 0
+fig <- function(caption = NULL) {
+  .fig_n <<- .fig_n + 1
+  if (is.null(caption)) paste0("Figure ", .fig_n)
+  else paste0("Figure ", .fig_n, ": ", caption)
+}
+
+as_series <- function(flq, name) {
+  df <- as.data.frame(flq)
+  df$year <- as.numeric(df$year)
+  if (!"lbnd" %in% names(df)) df$lbnd <- NA
+  if (!"ubnd" %in% names(df)) df$ubnd <- NA
+  df$series <- name
+  df[, c("year", "value", "lbnd", "ubnd", "series")]
+}
+
+round_digits <- function(series) ifelse(series == "Mean F", 4, 0)
+```
+
+```{r load}
+benchmark  <- new.env(); load("model/model_benchmark.RData",  envir = benchmark)
+obsvarpool <- new.env(); load("model/model_obsvarpool.RData", envir = obsvarpool)
+final      <- new.env(); load("model/model_final.RData",      envir = final)
+
+# named list of model environments - add/remove entries here to change which
+# runs appear throughout this report; every comparison below loops over this
+envs   <- list(benchmark = benchmark, obsvarpool = obsvarpool, final = final)
+models <- setNames(as.list(names(envs)), names(envs))
+
+find_previous_assessment <- function(stockcode) {
+  cur_dir  <- normalizePath(".")
+  cur_year <- suppressWarnings(as.numeric(sub("^([0-9]{4}).*", "\\1", basename(cur_dir))))
+  sibs     <- list.dirs(dirname(cur_dir), recursive = FALSE, full.names = TRUE)
+  cand     <- sibs[grepl(paste0("^[0-9]{4}_", stockcode, "_assessment$"), basename(sibs))]
+  cand_yr  <- suppressWarnings(as.numeric(sub("^([0-9]{4}).*", "\\1", basename(cand))))
+  keep     <- !is.na(cand_yr) & !is.na(cur_year) & cand_yr < cur_year
+  if (!any(keep)) return(NULL)
+  cand[keep][which.max(cand_yr[keep])]
+}
+
+prev_dir  <- find_previous_assessment("hom.27.4bc7d")
+prev_base <- if (!is.null(prev_dir)) file.path(prev_dir, "model", "model_base.RData") else NULL
+have_prev <- !is.null(prev_base) && file.exists(prev_base)
+
+if (have_prev) {
+  prev <- new.env(); load(prev_base, envir = prev)
+  prevYr <- dims(prev$NSHOM)$maxyear
+  prev_label <- paste0(prevYr, "-terminal")
+  models_all <- c(models, list(prev = prev_label))
+} else {
+  models_all <- models
+}
+```
+
+# Model configuration
+
+```{r config-table}
+fmt_groups <- function(mat) {
+  # collapse a fleet x age group-code matrix into "1 | 2-7 | 8-10 | 11-14" form,
+  # per fleet, for compact display
+  rows <- sapply(rownames(mat), function(fl) {
+    v <- mat[fl, ]
+    rl <- rle(v)
+    ages <- as.numeric(colnames(mat))
+    ends <- cumsum(rl$lengths)
+    starts <- ends - rl$lengths + 1
+    segs <- mapply(function(s, e) {
+      if (s == e) paste0(ages[s]) else paste0(ages[s], "-", ages[e])
+    }, starts, ends)
+    paste0(fl, ": ", paste(segs, collapse = " | "))
+  })
+  paste(rows, collapse = "; ")
+}
+
+describe_ctrl <- function(e) {
+  ctrl <- e$NSHOM.ctrl
+  list(
+    "Year range"        = paste0(ctrl@range["minyear"], "-", ctrl@range["maxyear"]),
+    "Plus group"         = as.character(ctrl@range["plusgroup"]),
+    "Fbar range"          = paste0(ctrl@range["minfbar"], "-", ctrl@range["maxfbar"]),
+    "cor.F"                = as.character(ctrl@cor.F),
+    "residuals"             = as.character(ctrl@residuals),
+    "States (F-at-age groups)" = fmt_groups(ctrl@states[rowSums(ctrl@states >= 0) > 0, , drop = FALSE]),
+    "F.vars groups"              = fmt_groups(ctrl@f.vars[rowSums(ctrl@f.vars >= 0) > 0, , drop = FALSE]),
+    "Obs.vars groups"             = fmt_groups(ctrl@obs.vars[rowSums(ctrl@obs.vars >= 0) > 0, , drop = FALSE]),
+    "biomassTreat"                 = paste(ctrl@biomassTreat, collapse = ", "),
+    "catch.vars downweighting"      = "startYr:2002 = 0.5, else 1"
+  )
+}
+
+cfg_mat <- sapply(envs, function(e) unlist(describe_ctrl(e)))
+cfg_df <- data.frame(Setting = rownames(cfg_mat), cfg_mat,
+                      row.names = NULL, stringsAsFactors = FALSE, check.names = FALSE)
+names(cfg_df)[-1] <- names(envs)
+
+differs <- apply(cfg_mat, 1, function(r) length(unique(r)) > 1)
+cfg_df$Differs <- differs
+
+DT::datatable(cfg_df, rownames = FALSE,
+              caption = "NSHOM.ctrl configuration - red = differs between the models",
+              options = list(pageLength = nrow(cfg_df), dom = "t", ordering = FALSE,
+                              columnDefs = list(list(visible = FALSE, targets = ncol(cfg_df) - 1))),
+              class = "stripe hover") %>%
+  DT::formatStyle(names(envs), valueColumns = "Differs",
+                   color = DT::styleEqual(c(TRUE, FALSE), c("#c0392b", "inherit")),
+                   fontWeight = DT::styleEqual(c(TRUE, FALSE), c("bold", "normal")))
+```
+
+# Stock summary: SSB, F, Recruitment
+
+```{r summary-data}
+summ_df <- bind_rows(lapply(names(envs), function(nm) {
+  e <- envs[[nm]]
+  bind_rows(as_series(ssb(e$NSHOM.sam),  "SSB"),
+            as_series(fbar(e$NSHOM.sam), "Mean F"),
+            as_series(rec(e$NSHOM.sam),  "Recruitment")) %>% mutate(model = models[[nm]])
+})) %>% mutate(model = factor(model, levels = unlist(models)))
+```
+
+```{r summary-plot, fig.width=9, fig.height=7}
+save_and_show(
+  ggplot(summ_df, aes(year, value, colour = model, fill = model)) +
+    geom_ribbon(aes(ymin = lbnd, ymax = ubnd), alpha = 0.12, colour = NA) +
+    geom_line(linewidth = 0.8) +
+    facet_wrap(~series, scales = "free_y", ncol = 1) +
+    labs(x = "Year", y = NULL, colour = NULL, fill = NULL, title = fig("SSB, mean F, and recruitment")),
+  "summary_ssb_f_rec.png", width = 9, height = 7
+)
+```
+
+```{r terminal-table}
+term_yr <- max(summ_df$year)
+term <- summ_df %>%
+  filter(year == term_yr) %>%
+  rowwise() %>%
+  mutate(Value = round(value, round_digits(series))) %>%
+  ungroup() %>%
+  select(series, model, Value) %>%
+  pivot_wider(names_from = model, values_from = Value)
+
+dt(term, caption = paste0("Terminal year (", term_yr, ")"), digits = unlist(models))
+```
+
+# Catch observation-variance parameters
+
+```{r obsvar-table}
+obsvar_cmp <- bind_rows(lapply(names(envs), function(nm) {
+  obs.var(envs[[nm]]$NSHOM.sam) %>% mutate(model = models[[nm]])
+})) %>%
+  filter(fleet == "catch unique") %>%
+  mutate(age = as.numeric(age), model = factor(model, levels = unlist(models)))
+
+obsvar_wide <- obsvar_cmp %>%
+  select(age, model, value) %>%
+  pivot_wider(names_from = model, values_from = value)
+
+dt(obsvar_wide, caption = "Catch obs.var by age", digits = unlist(models))
+```
+
+```{r obsvar-plot, fig.width=8, fig.height=4}
+save_and_show(
+  ggplot(obsvar_cmp, aes(age, CV, colour = model)) +
+    geom_line(linewidth = 1) + geom_point() +
+    labs(x = "Age", y = "CV of obs.var estimate", colour = NULL, title = fig("Catch obs.var precision (CV) by age")),
+  "obsvar_precision_cv.png", width = 8, height = 4
+)
+```
+
+# Full SAM parameter tables
+
+```{r partable}
+state_like <- c("logF", "logN", "logCatch", "logCatchByFleet", "logfbar", "logLagR", "logLand",
+                "logR", "logssb", "logtsb", "beforeLastLogF", "beforeLastLogN",
+                "lastLogF", "lastLogN", "missing")
+inactive_params <- c("logFScaleMSY", "implicitFunctionDelta", "splinePenalty")
+
+# which fleet(s)/age(s) each numbered instance of a parameter belongs to, read
+# directly from each model's own control object - computed per model since
+# benchmark and obsvarpool group ages differently for obs.vars
+describe_groups <- function(mat) {
+  vals <- sort(unique(mat[mat >= 0]))
+  setNames(sapply(vals, function(v) {
+    idx <- which(mat == v, arr.ind = TRUE)
+    fleets <- unique(rownames(mat)[idx[, 1]])
+    ages <- suppressWarnings(as.numeric(colnames(mat)[idx[, 2]]))
+    arng <- if (all(is.na(ages))) NA_character_
+            else if (length(unique(ages)) == 1) paste0("age ", unique(ages))
+            else paste0("ages ", min(ages, na.rm = TRUE), "-", max(ages, na.rm = TRUE))
+    paste0(paste(fleets, collapse = ", "), ifelse(is.na(arng), "", paste0(": ", arng)))
+  }), vals)
+}
+
+group_labels_for <- function(e) list(
+  logFpar      = tryCatch(describe_groups(e$NSHOM.ctrl@catchabilities), error = function(x) NULL),
+  logSdLogFsta = tryCatch(describe_groups(e$NSHOM.ctrl@f.vars),         error = function(x) NULL),
+  logSdLogN    = tryCatch(describe_groups(e$NSHOM.ctrl@logN.vars),      error = function(x) NULL),
+  logSdLogObs  = tryCatch(describe_groups(e$NSHOM.ctrl@obs.vars),       error = function(x) NULL)
+)
+group_labels_all <- lapply(envs, group_labels_for)  # keyed by env name (== model label)
+
+par_cmp <- bind_rows(lapply(names(envs), function(nm) {
+  envs[[nm]]$NSHOM.sam@params %>% mutate(model = models[[nm]])
+})) %>%
+  mutate(model = factor(model, levels = unlist(models))) %>%
+  filter(!name %in% state_like) %>%
+  group_by(model, name) %>%
+  mutate(occurrence = row_number()) %>%
+  ungroup() %>%
+  rowwise() %>%
+  mutate(ages = {
+    gl <- group_labels_all[[as.character(model)]]
+    g <- gl[[name]]
+    if (!is.null(g) && occurrence <= length(g)) g[occurrence] else NA_character_
+  }) %>%
+  ungroup() %>%
+  mutate(flag = case_when(
+    name %in% inactive_params            ~ "not active",
+    is.na(std.dev) | !is.finite(std.dev) ~ "check: non-finite SE",
+    std.dev > 2                          ~ "check: large SE",
+    TRUE                                 ~ "ok"
+  ))
+
+par_wide <- par_cmp %>%
+  mutate(cell = paste0(round(value, 3), " (", round(std.dev, 3), ")")) %>%
+  select(name, occurrence, model, ages, cell) %>%
+  pivot_wider(names_from = model, values_from = c(ages, cell))
+
+names(par_wide) <- c("Parameter", "#", paste0(names(envs), ": fleet/ages"),
+                      paste0(names(envs), ": est. (SE)"))
+dt(par_wide, pagelength = 15)
+```
+
+```{r partable-flags}
+flag_wide <- par_cmp %>%
+  select(name, occurrence, model, flag) %>%
+  pivot_wider(names_from = model, values_from = flag)
+
+mcols <- unlist(models)
+keep <- apply(as.data.frame(flag_wide)[, mcols, drop = FALSE], 1, function(r) any(r != "ok"))
+flag_wide <- flag_wide[keep, ]
+
+names(flag_wide) <- c("Parameter", "#", mcols)
+dt(flag_wide, caption = "Flagged parameters only (excludes 'ok' and 'not active' in all models)")
+```
+
+# Retrospective pattern
+
+```{r retro-plot, fig.width=9, fig.height=5}
+plot_retro_obj <- function(retro_list, label) {
+  tryCatch({
+    p <- plot(as(retro_list, "FLSAMs"))
+    # FLSAM's plot.FLSAMs returns a lattice trellis object, not ggplot2 - use
+    # lattice's own update(main=) to set a title, not ggplot2's `+ ggtitle()`
+    update(p, main = fig(paste0("Retrospective pattern - ", label)))
+  }, error = function(e) NULL)
+}
+
+# one PNG per model, then embed them all
+retro_paths <- character(0)
+for (nm in names(envs)) {
+  obj <- plot_retro_obj(envs[[nm]]$NSHOM.retro, models[[nm]])
+  if (is.null(obj)) next
+  f <- file.path(FIG_DIR, sprintf("retrospective_%s.png", nm))
+  png(f, width = 9, height = 5, units = "in", res = 300, bg = "white")
+  print(obj)
+  dev.off()
+  retro_paths <- c(retro_paths, f)
+}
+if (length(retro_paths)) knitr::include_graphics(retro_paths)
+```
+
+```{r mohns-rho, results='asis'}
+mohn_tab <- function(retro_list, label) {
+  tryCatch({
+    retro <- as(retro_list, "FLSAMs")
+    ref <- max(as.numeric(names(retro_list)))
+    m.ssb  <- mohns.rho(retro, type="ssb",  ref.year=ref, span=5); m.ssb$quant  <- "SSB"
+    m.fbar <- mohns.rho(retro, type="fbar", ref.year=ref, span=5); m.fbar$quant <- "Fbar"
+    m.rec  <- mohns.rho(retro, type="rec",  ref.year=ref, span=5); m.rec$quant  <- "Recruitment"
+    m <- do.call(rbind, list(m.ssb, m.fbar, m.rec))
+    m <- aggregate(rho ~ quant, subset(m, year != ref), mean)
+    m$model <- label
+    m
+  }, error = function(e) NULL)
+}
+mohn_all <- bind_rows(lapply(names(envs), function(nm) mohn_tab(envs[[nm]]$NSHOM.retro, models[[nm]])))
+if (nrow(mohn_all) > 0) {
+  mohn_all$model <- factor(mohn_all$model, levels = unlist(models))
+  mohn_wide <- mohn_all %>% select(quant, model, rho) %>% pivot_wider(names_from = model, values_from = rho)
+  names(mohn_wide) <- c("Quantity", unlist(models))
+  print(htmltools::tagList(dt(mohn_wide, caption = "Mohn's rho", digits = unlist(models))))
+}
+```
+
+# Leave-one-out pattern
+
+```{r loo, fig.width=11, fig.height=9}
+loo_cmp <- function(loo_list, label) {
+  if (length(loo_list) <= 1) return(NULL)
+  bind_rows(lapply(names(loo_list), function(nm) {
+    fit <- loo_list[[nm]]
+    bind_rows(
+      as_series(tryCatch(ssb(fit),  error = function(e) NULL), "SSB"),
+      as_series(tryCatch(fbar(fit), error = function(e) NULL), "Mean F"),
+      as_series(tryCatch(rec(fit),  error = function(e) NULL), "Recruitment")
+    ) %>% mutate(fleets = nm)
+  })) %>% mutate(model = label)
+}
+
+loo_all <- bind_rows(lapply(names(envs), function(nm) loo_cmp(envs[[nm]]$NSHOM.loo, models[[nm]])))
+
+if (nrow(loo_all) > 0) {
+  loo_all$series <- factor(loo_all$series, levels = c("SSB", "Mean F", "Recruitment"))
+  save_and_show(
+    ggplot(loo_all, aes(year, value, colour = fleets)) +
+      geom_line(linewidth = 0.7) +
+      facet_grid(series ~ model, scales = "free_y") +
+      labs(x = "Year", y = NULL, colour = "Fleets used", title = fig("Leave-one-out pattern")),
+    "leave_one_out.png", width = 11, height = 9
+  )
+}
+```
+
+# Harvest pattern (selectivity at age)
+
+```{r harvest-pattern, fig.width=13, fig.height=20}
+harvest_cmp <- bind_rows(lapply(names(envs), function(nm) {
+  as.data.frame(harvest(envs[[nm]]$NSHOM)) %>% mutate(model = models[[nm]])
+}))
+if (have_prev) harvest_cmp <- bind_rows(harvest_cmp,
+  as.data.frame(harvest(prev$NSHOM)) %>% mutate(model = prev_label))
+harvest_cmp <- harvest_cmp %>%
+  mutate(age = as.numeric(as.character(age)), year = as.numeric(as.character(year)),
+         model = factor(model, levels = unlist(models_all)),
+         year_f = factor(year, levels = sort(unique(year))))  # ascending: min year at top
+
+save_and_show(
+  ggplot(harvest_cmp, aes(age, data)) +
+    geom_area(fill = "steelblue4", alpha = 0.6, colour = "steelblue4", linewidth = 0.3) +
+    facet_grid(year_f ~ model, switch = "y", scales = "free_y") +
+    labs(x = "Age", y = NULL, title = fig("Harvest pattern (F at age) by year")) +
+    theme(strip.text.y.left = element_text(angle = 0, size = 7),
+          axis.text.y = element_blank(), axis.ticks.y = element_blank(),
+          panel.spacing.y = unit(0.1, "lines")),
+  "harvest_pattern_by_year.png", width = 13, height = 20
+)
+```
+
+# Stock-recruitment
+
+```{r stock-recruit, fig.width=9, fig.height=5}
+sr_envs <- envs
+if (have_prev) sr_envs$prev <- prev
+
+sr_cmp <- bind_rows(lapply(sr_envs, function(e) {
+  ssb_yr <- as.data.frame(ssb(e$NSHOM))[, c("year", "data")]; names(ssb_yr) <- c("year", "ssb")
+  rec_yr <- as.data.frame(rec(e$NSHOM))[, c("year", "data")]; names(rec_yr) <- c("year", "rec")
+  rage <- min(as.numeric(dimnames(e$NSHOM)$age))
+  sr_df <- rec_yr; sr_df$year <- as.numeric(sr_df$year) - rage
+  merge(sr_df, ssb_yr, by = "year")
+}), .id = "which") %>%
+  mutate(model = ifelse(which %in% names(models), unlist(models)[which],
+                         if (have_prev) prev_label else NA_character_))
+
+save_and_show(
+  ggplot(sr_cmp, aes(ssb, rec, colour = model)) +
+    geom_path(aes(group = model), alpha = 0.3) +
+    geom_point() +
+    labs(x = "SSB", y = "Recruitment", colour = NULL, title = fig("Stock-recruitment relationship")),
+  "stock_recruit.png", width = 9, height = 5
+)
+```
+
+# SAM fit residuals
+
+```{r sam-residuals, fig.width=13, fig.height=8}
+resid_cmp <- bind_rows(lapply(names(envs), function(nm) {
+  envs[[nm]]$NSHOM.sam@residuals %>% mutate(model = models[[nm]])
+}))
+if (have_prev) resid_cmp <- bind_rows(resid_cmp, prev$NSHOM.sam@residuals %>% mutate(model = prev_label))
+resid_cmp <- resid_cmp %>%
+  filter(!is.na(std.res)) %>%
+  mutate(age = as.numeric(age), direction = ifelse(std.res >= 0, "under-predicted", "over-predicted"),
+         model = factor(model, levels = unlist(models_all)))
+
+save_and_show(
+  ggplot(resid_cmp, aes(year, age, size = abs(std.res), colour = direction)) +
+    geom_point(alpha = 0.6) +
+    scale_size_area(max_size = 5, name = "|std. residual|") +
+    scale_colour_manual(values = c("under-predicted" = "#1f6feb", "over-predicted" = "#d1242f"), name = NULL) +
+    facet_grid(fleet ~ model, scales = "free_y") +
+    labs(x = "Year", y = "Age", title = fig("SAM standardized log residuals")),
+  "sam_residuals.png", width = 13, height = 8
+)
+```
+
+# Observation variance and survey catchability
+
+```{r obs-var-plot2, fig.width=11, fig.height=6}
+obsvar_cmp2 <- bind_rows(lapply(names(envs), function(nm) {
+  obs.var(envs[[nm]]$NSHOM.sam) %>% mutate(model = models[[nm]])
+}))
+if (have_prev) obsvar_cmp2 <- bind_rows(obsvar_cmp2, obs.var(prev$NSHOM.sam) %>% mutate(model = prev_label))
+obsvar_cmp2$model <- factor(obsvar_cmp2$model, levels = unlist(models_all))
+
+save_and_show(
+  ggplot(obsvar_cmp2, aes(factor(age), value, colour = model)) +
+    geom_pointrange(aes(ymin = lbnd, ymax = ubnd), fatten = 2,
+                     position = position_dodge(width = 0.5)) +
+    facet_wrap(~fleet, scales = "free_x", nrow = 1) +
+    labs(x = "Age", y = "Observation variance", colour = NULL, title = fig("Observation variance by fleet and age (natural scale)")),
+  "obs_variance_natural.png", width = 11, height = 6
+)
+```
+
+```{r obs-var-plot-log, fig.width=11, fig.height=6}
+par_cmp_log <- par_cmp
+if (have_prev) {
+  group_labels_prev <- group_labels_for(prev)
+  par_prev <- prev$NSHOM.sam@params %>%
+    mutate(model = prev_label) %>%
+    filter(!name %in% state_like) %>%
+    group_by(name) %>%
+    mutate(occurrence = row_number()) %>%
+    ungroup() %>%
+    rowwise() %>%
+    mutate(ages = {
+      g <- group_labels_prev[[name]]
+      if (!is.null(g) && occurrence <= length(g)) g[occurrence] else NA_character_
+    }) %>%
+    ungroup() %>%
+    mutate(flag = NA_character_)
+  par_cmp_log <- bind_rows(par_cmp_log, par_prev)
+}
+
+obsvar_log <- par_cmp_log %>%
+  filter(name == "logSdLogObs") %>%
+  mutate(lo = value - 1.96 * std.dev, hi = value + 1.96 * std.dev,
+         model = factor(model, levels = unlist(models_all)))
+
+save_and_show(
+  ggplot(obsvar_log, aes(ages, value, colour = model)) +
+    geom_pointrange(aes(ymin = lo, ymax = hi), fatten = 2,
+                     position = position_dodge(width = 0.5)) +
+    labs(x = "Fleet / ages", y = "logSdLogObs (log scale, value ± 1.96×SE)", colour = NULL,
+         title = fig("Observation variance by fleet and age (log scale)")) +
+    theme(axis.text.x = element_text(angle = 30, hjust = 1)),
+  "obs_variance_log.png", width = 11, height = 6
+)
+```
+
+```{r catchability-plot2, fig.width=9, fig.height=5}
+q_cmp <- bind_rows(lapply(names(envs), function(nm) {
+  catchabilities(envs[[nm]]$NSHOM.sam) %>% mutate(model = models[[nm]])
+}))
+if (have_prev) q_cmp <- bind_rows(q_cmp, catchabilities(prev$NSHOM.sam) %>% mutate(model = prev_label))
+q_cmp$model <- factor(q_cmp$model, levels = unlist(models_all))
+
+save_and_show(
+  ggplot(q_cmp, aes(factor(age), value, colour = model)) +
+    geom_pointrange(aes(ymin = lbnd, ymax = ubnd), fatten = 2,
+                     position = position_dodge(width = 0.5)) +
+    facet_wrap(~fleet, scales = "free_x") +
+    labs(x = "Age", y = "Catchability (q)", colour = NULL, title = fig("Survey catchability at age")),
+  "catchability.png", width = 9, height = 5
+)
+```
+
+# Process (state) variance
+
+```{r process-variance2, fig.width=9, fig.height=5}
+proc_list <- lapply(names(envs), function(nm) envs[[nm]]$NSHOM.sam@params %>% mutate(model = models[[nm]]))
+if (have_prev) proc_list <- c(proc_list, list(prev$NSHOM.sam@params %>% mutate(model = prev_label)))
+
+proc_cmp <- bind_rows(proc_list) %>%
+  filter(name %in% c("logSdLogFsta", "logSdLogN")) %>%
+  group_by(model, name) %>%
+  mutate(group = paste0(recode(name, logSdLogFsta = "F", logSdLogN = "N (recruitment/state)"),
+                         " - group ", row_number())) %>%
+  ungroup() %>%
+  mutate(sd = exp(value), lo = exp(value - 1.96 * std.dev), hi = exp(value + 1.96 * std.dev),
+         model = factor(model, levels = unlist(models_all)))
+
+save_and_show(
+  ggplot(proc_cmp, aes(group, sd, colour = model)) +
+    geom_pointrange(aes(ymin = lo, ymax = hi), fatten = 2, position = position_dodge(width = 0.5)) +
+    labs(x = NULL, y = "Process error SD", colour = NULL, title = fig("Process (state) variance")) +
+    theme(axis.text.x = element_text(angle = 20, hjust = 1)),
+  "process_variance.png", width = 9, height = 5
+)
+```
+
+# Comparison with the `r if (have_prev) prevYr else "previous"`-terminal assessment
+
+```{r three-way-data}
+if (have_prev) {
+  three_way <- bind_rows(
+    bind_rows(as_series(ssb(prev$NSHOM.sam), "SSB"),
+              as_series(fbar(prev$NSHOM.sam), "Mean F"),
+              as_series(rec(prev$NSHOM.sam), "Recruitment")) %>% mutate(run = prev_label),
+    bind_rows(lapply(names(envs), function(nm) {
+      e <- envs[[nm]]
+      bind_rows(as_series(ssb(e$NSHOM.sam), "SSB"),
+                as_series(fbar(e$NSHOM.sam), "Mean F"),
+                as_series(rec(e$NSHOM.sam), "Recruitment")) %>% mutate(run = models[[nm]])
+    }))
+  )
+  three_way$series <- factor(three_way$series, levels = c("SSB", "Mean F", "Recruitment"))
+  three_way$run <- factor(three_way$run, levels = c(prev_label, unlist(models)))
+}
+```
+
+```{r three-way-plot, fig.width=9, fig.height=8, results='asis'}
+if (have_prev) {
+  # this chunk stays results='asis' for the DT table below, so save the figure
+  # explicitly and print() it rather than going through save_and_show()
+  p_three_way <- ggplot(three_way, aes(year, value, colour = run)) +
+    geom_vline(xintercept = prevYr, linetype = "dashed", colour = "grey60") +
+    geom_line(linewidth = 0.8) +
+    facet_wrap(~series, scales = "free_y", ncol = 1) +
+    labs(x = "Year", y = NULL, colour = NULL,
+         title = fig("SSB, Mean F, Recruitment - previous vs. all candidate runs")) +
+    theme(legend.position = "top")
+  ggsave(file.path(FIG_DIR, "three_way_prev_vs_candidates.png"), p_three_way,
+         width = 9, height = 8, dpi = 300, bg = "white")
+  print(p_three_way)
+
+  pct_tab <- inner_join(
+    filter(three_way, run == prev_label, year == prevYr) %>% select(series, prev = value),
+    filter(three_way, run != prev_label, year == prevYr) %>% select(series, run, cur = value),
+    by = "series"
+  ) %>%
+    rowwise() %>%
+    mutate(`This year` = round(cur, round_digits(series)),
+           `% revision` = round((cur - prev) / prev * 100, 1)) %>%
+    ungroup() %>%
+    select(series, run, `This year`, `% revision`) %>%
+    pivot_wider(names_from = run, values_from = c(`This year`, `% revision`))
+
+  prev_col <- filter(three_way, run == prev_label, year == prevYr) %>%
+    rowwise() %>% mutate(!!prev_label := round(value, round_digits(series))) %>%
+    ungroup() %>% select(series, !!prev_label)
+
+  pct_tab <- left_join(prev_col, pct_tab, by = "series")
+  numeric_cols <- names(pct_tab)[sapply(pct_tab, is.numeric)]
+
+  print(htmltools::tagList(dt(pct_tab, caption = paste("Revision at", prevYr), digits = numeric_cols)))
+}
+```
